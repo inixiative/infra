@@ -1,0 +1,84 @@
+{
+  "name": "@inixiative/infra",
+  "version": "0.1.0",
+  "description": "Stateless infrastructure and hosting drivers (Railway, Render, Fly.io Machines, Firecracker) plus workload lifecycle, wind-down, staggered wake, and hosting cost projection.",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "format": "biome format --write .",
+    "check": "bun run typecheck && bun run lint && bun run test",
+    "prepublishOnly": "bun run check && bun run build"
+  },
+  "keywords": [
+    "infrastructure",
+    "hosting",
+    "railway",
+    "render",
+    "fly",
+    "firecracker",
+    "microvm",
+    "lifecycle",
+    "inixiative"
+  ],
+  "author": "Aron Greenspan",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/inixiative/infra.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./railway": {
+      "types": "./dist/railway/index.d.ts",
+      "import": "./dist/railway/index.js",
+      "require": "./dist/railway/index.cjs"
+    },
+    "./render": {
+      "types": "./dist/render/index.d.ts",
+      "import": "./dist/render/index.js",
+      "require": "./dist/render/index.cjs"
+    },
+    "./fly": {
+      "types": "./dist/fly/index.d.ts",
+      "import": "./dist/fly/index.js",
+      "require": "./dist/fly/index.cjs"
+    },
+    "./firecracker": {
+      "types": "./dist/firecracker/index.d.ts",
+      "import": "./dist/firecracker/index.js",
+      "require": "./dist/firecracker/index.cjs"
+    },
+    "./lifecycle": {
+      "types": "./dist/lifecycle/index.d.ts",
+      "import": "./dist/lifecycle/index.js",
+      "require": "./dist/lifecycle/index.cjs"
+    }
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.2",
+    "@inixiative/config": "^0.5.237",
+    "@types/bun": "1.4.4",
+    "@types/node": "^25.3.5",
+    "tsup": "8.5.1",
+    "typescript": "6.0.3"
+  },
+  "packageManager": "bun@1.4.4"
+}
