@@ -236,6 +236,7 @@ export const evaluateWorkloadLifecycle = (
   if (snapshot.state === 'draining') {
     const drainElapsedMs = Math.max(0, nowMs - snapshot.stateEnteredAtMs);
     const drainDeadlineMs = snapshot.stateEnteredAtMs + policy.drainGraceMs;
+    const idleElapsedMs = Math.max(0, nowMs - snapshot.lastActivityAtMs);
 
     if (hasActiveWork) {
       if (!maxLifetimeReached) {
@@ -256,6 +257,22 @@ export const evaluateWorkloadLifecycle = (
         action: 'terminate',
         reason: 'max_lifetime_exceeded_with_active_work',
         nextCheckAtMs: null,
+      };
+    }
+
+    if (
+      hasPendingApprovals &&
+      !maxLifetimeReached &&
+      policy.pendingApprovalGraceMs > 0 &&
+      idleElapsedMs < policy.pendingApprovalGraceMs
+    ) {
+      return {
+        action: 'none',
+        reason: 'waiting_for_pending_approval',
+        nextCheckAtMs: earliestCheckTime(
+          lifetimeDeadlineMs,
+          snapshot.lastActivityAtMs + policy.pendingApprovalGraceMs,
+        ),
       };
     }
 

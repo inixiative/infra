@@ -53,6 +53,19 @@ const unixServer = Bun.serve({
   fetch: async (request) => {
     const path = new URL(request.url).pathname;
     if (path === '/ok') return Response.json({ transport: 'node-http-unix' });
+    if (path === '/slow-stream') {
+      return new Response(
+        new ReadableStream({
+          async start(controller) {
+            controller.enqueue(new TextEncoder().encode('{"partial":'));
+            await Bun.sleep(250);
+            controller.enqueue(new TextEncoder().encode('true}'));
+            controller.close();
+          },
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
+    }
     return new Response('missing', { status: 404 });
   },
 });
@@ -144,6 +157,26 @@ describe('core primitives', () => {
         provider: 'firecracker',
       }),
     ).rejects.toMatchObject({ code: 'not_found', provider: 'firecracker' });
+
+    // Validates timeoutMs directly on sendUnixSocketHttpRequest
+    await expect(
+      sendUnixSocketHttpRequest('http://localhost/ok', unixSocketPath, {
+        method: 'GET',
+        headers: { Accept: 'application/json' },
+        timeoutMs: 0,
+        provider: 'firecracker',
+      }),
+    ).rejects.toMatchObject({ code: 'invalid_request', provider: 'firecracker' });
+
+    // Enforces total request deadline even when response headers/first chunk arrive immediately
+    await expect(
+      sendUnixSocketHttpRequest('http://localhost/slow-stream', unixSocketPath, {
+        method: 'GET',
+        headers: { Accept: 'application/json' },
+        timeoutMs: 40,
+        provider: 'firecracker',
+      }),
+    ).rejects.toMatchObject({ code: 'unreachable', retryable: true, provider: 'firecracker' });
 
     expect(() => assertNoEgressAllowlist(['api.anthropic.com'], 'fly')).toThrow(InfraError);
     expect(() => assertNoEgressAllowlist([], 'fly')).not.toThrow();

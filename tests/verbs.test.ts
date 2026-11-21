@@ -68,11 +68,26 @@ describe('verbs and vocabulary', () => {
       for (const name of parseExportedSymbols(source)) allExported.add(name);
     }
 
-    // Collect backticked identifiers from table Name columns and Exported Types / Constants sections
+    // Collect backticked identifiers from table Name columns, Constants/Drivers lists, and Exported Types
     const documentedSymbols = new Set<string>();
-    for (const line of verbsDoc.split('\n')) {
+    const lines = verbsDoc.split('\n');
+    let inConstantsList = false;
+    for (const line of lines) {
       const tableMatch = line.match(/^\|\s*[^|]+\|\s*`([A-Za-z_][A-Za-z0-9_]*)`\s*\|/);
-      if (tableMatch?.[1]) documentedSymbols.add(tableMatch[1]);
+      if (tableMatch?.[1]) {
+        documentedSymbols.add(tableMatch[1]);
+        continue;
+      }
+      if (/^(Constants and registries|Drivers and constants|Constants):/.test(line)) {
+        inConstantsList = true;
+      } else if (line.trim() === '') {
+        inConstantsList = false;
+      }
+      if (inConstantsList) {
+        for (const match of line.matchAll(/`([A-Za-z_][A-Za-z0-9_]*)`/g)) {
+          if (match[1]) documentedSymbols.add(match[1]);
+        }
+      }
     }
     const typesSection = verbsDoc.split('## Exported Types')[1] ?? '';
     for (const match of typesSection.matchAll(/`([A-Za-z_][A-Za-z0-9_]*)`/g)) {

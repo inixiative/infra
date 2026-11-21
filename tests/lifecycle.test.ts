@@ -185,6 +185,21 @@ describe('defaultWorkloadLifecyclePolicy and evaluateWorkloadLifecycle', () => {
     expect(waitingApproval.action).toBe('none');
     expect(waitingApproval.reason).toBe('waiting_for_pending_approval');
 
+    // Pending approvals surfaced during drain are also respected inside pendingApprovalGraceMs
+    const drainingWithApproval = evaluateWorkloadLifecycle(
+      baseSnapshot({
+        workloadClass: 'ephemeral-session',
+        state: 'draining',
+        stateEnteredAtMs: BASE_TIME - 90_000,
+        lastActivityAtMs: BASE_TIME - 20 * MINUTE,
+        pendingApprovals: 1,
+        archiveFlushed: true,
+      }),
+      BASE_TIME,
+    );
+    expect(drainingWithApproval.action).toBe('none');
+    expect(drainingWithApproval.reason).toBe('waiting_for_pending_approval');
+
     const expiredApproval = evaluateWorkloadLifecycle(
       baseSnapshot({
         workloadClass: 'ephemeral-session',

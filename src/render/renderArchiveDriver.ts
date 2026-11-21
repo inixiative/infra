@@ -145,12 +145,14 @@ export const renderArchiveDriver: ArchiveHostingDriver = {
             deployment.apiUrl,
           )
         : undefined) ?? (await fetchRenderServiceByName(deployment));
-    const databaseId = encodeURIComponent(
-      requireNonEmpty(deployment.ids.databaseId, 'Render databaseId', 'render'),
-    );
-    const service =
-      existing ??
-      (
+    let service: RenderService;
+    if (existing) {
+      service = existing;
+    } else {
+      const databaseId = encodeURIComponent(
+        requireNonEmpty(deployment.ids.databaseId, 'Render databaseId', 'render'),
+      );
+      service = (
         await sendRenderRequest<{ service: RenderService }>(
           deployment.token,
           '/services',
@@ -190,6 +192,7 @@ export const renderArchiveDriver: ArchiveHostingDriver = {
           deployment.apiUrl,
         )
       ).service;
+    }
     return {
       ids: { ...deployment.ids, serviceId: service.id },
       url: requireNonEmpty(service.serviceDetails?.url, 'Render service url', 'render'),

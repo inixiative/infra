@@ -81,6 +81,8 @@ export const sendUnixSocketHttpRequest = async <T = unknown>(
     readonly provider?: string;
   },
 ): Promise<T> => {
+  const timeoutMs = validateTimeoutMs(options.timeoutMs, options.provider);
+
   let parsedUrl: URL;
   try {
     parsedUrl = new URL(url);
@@ -94,6 +96,23 @@ export const sendUnixSocketHttpRequest = async <T = unknown>(
   const requestPath = `${parsedUrl.pathname}${parsedUrl.search}`;
   const response = await new Promise<{ readonly status: number; readonly body: string }>(
     (resolve, reject) => {
+      let settled = false;
+      let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+
+      const settleResolve = (result: { readonly status: number; readonly body: string }) => {
+        if (settled) return;
+        settled = true;
+        if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+        resolve(result);
+      };
+
+      const settleReject = (error: InfraError) => {
+        if (settled) return;
+        settled = true;
+        if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+        reject(error);
+      };
+
       const req = nodeHttpRequest(
         {
           socketPath,
@@ -105,7 +124,7 @@ export const sendUnixSocketHttpRequest = async <T = unknown>(
               ? { 'Content-Length': String(Buffer.byteLength(options.serializedBody)) }
               : {}),
           },
-          timeout: options.timeoutMs,
+          timeout: timeoutMs,
         },
         (res) => {
           const chunks: Buffer[] = [];
@@ -113,13 +132,24 @@ export const sendUnixSocketHttpRequest = async <T = unknown>(
             chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
           });
           res.on('end', () => {
-            resolve({
+            settleResolve({
               status: res.statusCode ?? 0,
               body: Buffer.concat(chunks).toString('utf8'),
             });
           });
+          res.on('close', () => {
+            if (!res.complete) {
+              settleReject(
+                new InfraError(
+                  'unreachable',
+                  `Unix socket response closed prematurely for ${sanitizeUrlForError(url)}`,
+                  { provider: options.provider },
+                ),
+              );
+            }
+          });
           res.on('error', (cause) => {
-            reject(
+            settleReject(
               new InfraError(
                 'unreachable',
                 `Unix socket response failed for ${sanitizeUrlForError(url)}`,
@@ -130,11 +160,23 @@ export const sendUnixSocketHttpRequest = async <T = unknown>(
         },
       );
 
+      deadlineTimer = setTimeout(() => {
+        const timeoutCause = new Error(`Unix socket request exceeded deadline of ${timeoutMs}ms`);
+        req.destroy(timeoutCause);
+        settleReject(
+          new InfraError(
+            'unreachable',
+            `Unix socket request timed out for ${sanitizeUrlForError(url)}`,
+            { provider: options.provider, cause: timeoutCause },
+          ),
+        );
+      }, timeoutMs);
+
       req.on('timeout', () => {
-        req.destroy(new Error(`Unix socket request timed out after ${options.timeoutMs}ms`));
+        req.destroy(new Error(`Unix socket request timed out after ${timeoutMs}ms`));
       });
       req.on('error', (cause) => {
-        reject(
+        settleReject(
           new InfraError(
             'unreachable',
             `Unix socket request failed for ${sanitizeUrlForError(url)}`,

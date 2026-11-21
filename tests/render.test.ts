@@ -218,6 +218,11 @@ describe('renderArchiveDriver', () => {
     expect(url).toBe(state.serviceUrl);
     expect(await renderArchiveDriver.fetchServiceReadiness(makeDeployment(running))).toBe(true);
 
+    // Adopting an existing service by name or serviceId works even without databaseId
+    const adopted = await renderArchiveDriver.provisionService(makeDeployment({}));
+    expect(adopted.ids.serviceId).toBe(running.serviceId);
+    expect(adopted.url).toBe(state.serviceUrl);
+
     const deploying = await renderArchiveDriver.deployImage({
       ...makeDeployment(running),
       imageVersion: '0.8.0',
