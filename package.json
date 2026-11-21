@@ -17,7 +17,8 @@
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",
     "format": "biome format --write .",
-    "check": "bun run typecheck && bun run lint && bun run test",
+    "check:all": "bun run typecheck && bun run lint && bun run test",
+    "check": "inixiative-config bounded -- bun run check:all",
     "prepublishOnly": "bun run check && bun run build"
   },
   "keywords": [
@@ -74,7 +75,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.2",
-    "@inixiative/config": "^0.5.237",
+    "@inixiative/config": "^0.5.239",
     "@types/bun": "1.4.4",
     "@types/node": "^25.3.5",
     "tsup": "8.5.1",
