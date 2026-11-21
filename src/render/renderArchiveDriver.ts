@@ -4,19 +4,18 @@ import {
   ARCHIVE_PORT,
   type ArchiveDeployment,
   type ArchiveHostingDriver,
-  archiveTokenOf,
+  archiveTokenOrThrow,
   type HostingWorkspace,
   type ImageDeployStatus,
 } from '../core/contracts.ts';
-import { InfraError } from '../core/infraError.ts';
+import { InfraError, requireNonEmpty } from '../core/infraError.ts';
+import { RENDER_ENDED_DEPLOY_STATUSES, RENDER_FAILED_DEPLOY_STATUSES } from './renderPlans.ts';
 import { deleteRenderResource, sendRenderRequest } from './renderRequest.ts';
 
 export const RENDER_REGION = 'oregon';
 export const RENDER_DATABASE_PLAN = 'basic_256mb';
 export const RENDER_SERVICE_PLAN = 'starter';
 
-const FAILED_DEPLOYS = new Set(['build_failed', 'update_failed', 'pre_deploy_failed', 'canceled']);
-const ENDED_DEPLOYS = new Set([...FAILED_DEPLOYS, 'deactivated']);
 const OWNER_PAGE_SIZE = 100;
 
 type RenderOwner = { id: string; name?: string | null; email?: string | null };
@@ -26,15 +25,6 @@ type RenderService = {
   name: string;
   suspended?: string;
   serviceDetails?: { url?: string };
-};
-
-const requireRenderValue = (value: string | undefined, label: string): string => {
-  if (!value) {
-    throw new InfraError('invalid_request', `Missing required Render ${label}`, {
-      provider: 'render',
-    });
-  }
-  return value;
 };
 
 const renderNameQuery = (name: string, ownerId: string): string =>
@@ -67,6 +57,7 @@ export const fetchRenderOwners = async (
   apiUrl?: string,
 ): Promise<HostingWorkspace[]> => {
   const workspaces: HostingWorkspace[] = [];
+  const seenCursors = new Set<string>();
   let cursor: string | undefined;
   do {
     const query = new URLSearchParams({
@@ -87,7 +78,16 @@ export const fetchRenderOwners = async (
     workspaces.push(
       ...page.map(({ owner }) => ({ id: owner.id, name: owner.name || owner.email || owner.id })),
     );
-    cursor = page.length === OWNER_PAGE_SIZE ? page.at(-1)?.cursor : undefined;
+    const nextCursor = page.length === OWNER_PAGE_SIZE ? page.at(-1)?.cursor : undefined;
+    if (nextCursor !== undefined) {
+      if (seenCursors.has(nextCursor)) {
+        throw new InfraError('provider_unavailable', 'Render owners pagination cursor repeated', {
+          provider: 'render',
+        });
+      }
+      seenCursors.add(nextCursor);
+    }
+    cursor = nextCursor;
   } while (cursor);
   return workspaces;
 };
@@ -119,9 +119,12 @@ export const renderArchiveDriver: ArchiveHostingDriver = {
     return { ...deployment.ids, databaseId: database.id };
   },
   fetchDatabaseReadiness: async (deployment) => {
+    const databaseId = encodeURIComponent(
+      requireNonEmpty(deployment.ids.databaseId, 'Render databaseId', 'render'),
+    );
     const { status } = await sendRenderRequest<RenderPostgres>(
       deployment.token,
-      `/postgres/${requireRenderValue(deployment.ids.databaseId, 'databaseId')}`,
+      `/postgres/${databaseId}`,
       {},
       deployment.apiUrl,
     );
@@ -137,11 +140,14 @@ export const renderArchiveDriver: ArchiveHostingDriver = {
       (deployment.ids.serviceId
         ? await sendRenderRequest<RenderService>(
             deployment.token,
-            `/services/${deployment.ids.serviceId}`,
+            `/services/${encodeURIComponent(deployment.ids.serviceId)}`,
             {},
             deployment.apiUrl,
           )
         : undefined) ?? (await fetchRenderServiceByName(deployment));
+    const databaseId = encodeURIComponent(
+      requireNonEmpty(deployment.ids.databaseId, 'Render databaseId', 'render'),
+    );
     const service =
       existing ??
       (
@@ -159,14 +165,14 @@ export const renderArchiveDriver: ArchiveHostingDriver = {
                 imagePath: `${ARCHIVE_IMAGE}:${deployment.imageVersion}`,
               },
               envVars: [
-                { key: 'ARCHIVE_SERVER_TOKEN', value: archiveTokenOf(deployment) },
+                { key: 'ARCHIVE_SERVER_TOKEN', value: archiveTokenOrThrow(deployment) },
                 { key: 'PORT', value: String(ARCHIVE_PORT) },
                 {
                   key: 'DATABASE_URL',
                   value: (
                     await sendRenderRequest<{ internalConnectionString: string }>(
                       deployment.token,
-                      `/postgres/${requireRenderValue(deployment.ids.databaseId, 'databaseId')}/connection-info`,
+                      `/postgres/${databaseId}/connection-info`,
                       {},
                       deployment.apiUrl,
                     )
@@ -186,18 +192,21 @@ export const renderArchiveDriver: ArchiveHostingDriver = {
       ).service;
     return {
       ids: { ...deployment.ids, serviceId: service.id },
-      url: requireRenderValue(service.serviceDetails?.url, 'service url'),
+      url: requireNonEmpty(service.serviceDetails?.url, 'Render service url', 'render'),
     };
   },
   fetchServiceReadiness: async (deployment) => {
+    const serviceId = encodeURIComponent(
+      requireNonEmpty(deployment.ids.serviceId, 'Render serviceId', 'render'),
+    );
     const [latest] = await sendRenderRequest<{ deploy: { status: string } }[]>(
       deployment.token,
-      `/services/${requireRenderValue(deployment.ids.serviceId, 'serviceId')}/deploys?limit=1`,
+      `/services/${serviceId}/deploys?limit=1`,
       {},
       deployment.apiUrl,
     );
     if (!latest) return false;
-    if (FAILED_DEPLOYS.has(latest.deploy.status)) {
+    if (RENDER_FAILED_DEPLOY_STATUSES.has(latest.deploy.status)) {
       throw new InfraError('deploy_failed', `Render deploy ${latest.deploy.status}`, {
         provider: 'render',
       });
@@ -205,16 +214,21 @@ export const renderArchiveDriver: ArchiveHostingDriver = {
     return latest.deploy.status === 'live';
   },
   fetchServiceFailureStatus: async (deployment) => {
+    const serviceId = encodeURIComponent(
+      requireNonEmpty(deployment.ids.serviceId, 'Render serviceId', 'render'),
+    );
     const [latest] = await sendRenderRequest<{ deploy: { status: string } }[]>(
       deployment.token,
-      `/services/${requireRenderValue(deployment.ids.serviceId, 'serviceId')}/deploys?limit=1`,
+      `/services/${serviceId}/deploys?limit=1`,
       {},
       deployment.apiUrl,
     );
-    return Boolean(latest && FAILED_DEPLOYS.has(latest.deploy.status));
+    return Boolean(latest && RENDER_FAILED_DEPLOY_STATUSES.has(latest.deploy.status));
   },
   deployImage: async (deployment) => {
-    const serviceId = requireRenderValue(deployment.ids.serviceId, 'serviceId');
+    const serviceId = encodeURIComponent(
+      requireNonEmpty(deployment.ids.serviceId, 'Render serviceId', 'render'),
+    );
     const imagePath = `${ARCHIVE_IMAGE}:${deployment.imageVersion}`;
     await sendRenderRequest(
       deployment.token,
@@ -236,13 +250,16 @@ export const renderArchiveDriver: ArchiveHostingDriver = {
     );
     return {
       ...deployment.ids,
-      deploymentId: requireRenderValue(deploy?.id, 'deploymentId'),
+      deploymentId: requireNonEmpty(deploy?.id, 'Render deploymentId', 'render'),
     };
   },
   restoreImage: async (deployment) => {
+    const serviceId = encodeURIComponent(
+      requireNonEmpty(deployment.ids.serviceId, 'Render serviceId', 'render'),
+    );
     await sendRenderRequest(
       deployment.token,
-      `/services/${requireRenderValue(deployment.ids.serviceId, 'serviceId')}`,
+      `/services/${serviceId}`,
       {
         method: 'PATCH',
         body: {
@@ -256,24 +273,38 @@ export const renderArchiveDriver: ArchiveHostingDriver = {
     );
   },
   fetchImageDeployStatus: async (deployment): Promise<ImageDeployStatus> => {
+    const serviceId = encodeURIComponent(
+      requireNonEmpty(deployment.ids.serviceId, 'Render serviceId', 'render'),
+    );
+    const deploymentId = encodeURIComponent(
+      requireNonEmpty(deployment.ids.deploymentId, 'Render deploymentId', 'render'),
+    );
     const { status } = await sendRenderRequest<{ status: string }>(
       deployment.token,
-      `/services/${requireRenderValue(deployment.ids.serviceId, 'serviceId')}/deploys/${requireRenderValue(deployment.ids.deploymentId, 'deploymentId')}`,
+      `/services/${serviceId}/deploys/${deploymentId}`,
       {},
       deployment.apiUrl,
     );
     if (status === 'live') return 'live';
-    return ENDED_DEPLOYS.has(status) ? 'failed' : 'deploying';
+    return RENDER_ENDED_DEPLOY_STATUSES.has(status) ? 'failed' : 'deploying';
   },
   destroyService: async (deployment) => {
     const serviceId = deployment.ids.serviceId ?? (await fetchRenderServiceByName(deployment))?.id;
     if (serviceId) {
-      await deleteRenderResource(deployment.token, `/services/${serviceId}`, deployment.apiUrl);
+      await deleteRenderResource(
+        deployment.token,
+        `/services/${encodeURIComponent(serviceId)}`,
+        deployment.apiUrl,
+      );
     }
     const databaseId =
       deployment.ids.databaseId ?? (await fetchRenderDatabaseByName(deployment))?.id;
     if (databaseId) {
-      await deleteRenderResource(deployment.token, `/postgres/${databaseId}`, deployment.apiUrl);
+      await deleteRenderResource(
+        deployment.token,
+        `/postgres/${encodeURIComponent(databaseId)}`,
+        deployment.apiUrl,
+      );
     }
   },
 };

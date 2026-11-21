@@ -7,7 +7,7 @@ import type {
   WorkloadStatus,
   WorkloadUsage,
 } from '../core/contracts.ts';
-import { InfraError } from '../core/infraError.ts';
+import { assertNoEgressAllowlist, InfraError, requireNonEmpty } from '../core/infraError.ts';
 import {
   deleteRailwayService,
   deployRailwayServiceInstance,
@@ -30,15 +30,12 @@ const requireRailwayToken = (credentials: WorkloadCredentials): string => {
   return credentials.token;
 };
 
-const requireEnvironmentId = (credentials: WorkloadCredentials, handle: WorkloadHandle): string => {
-  const environmentId = handle.environmentId ?? credentials.environmentId;
-  if (!environmentId) {
-    throw new InfraError('invalid_request', 'Railway environmentId is required', {
-      provider: 'railway',
-    });
-  }
-  return environmentId;
-};
+const requireEnvironmentId = (credentials: WorkloadCredentials, handle: WorkloadHandle): string =>
+  requireNonEmpty(
+    handle.environmentId ?? credentials.environmentId,
+    'Railway environmentId',
+    'railway',
+  );
 
 const mapRailwayDeploymentState = (status: string | undefined): WorkloadRuntimeState => {
   switch (status) {
@@ -72,19 +69,21 @@ export const railwayWorkloadDriver: WorkloadDriver = {
     spec: WorkloadSpec,
   ): Promise<WorkloadHandle> => {
     const token = requireRailwayToken(credentials);
+    assertNoEgressAllowlist(spec.egressAllowlist, 'railway');
+
     let projectId = credentials.projectId;
     let environmentId = credentials.environmentId;
     if (!projectId || !environmentId) {
-      if (!credentials.workspaceId) {
+      if (!projectId && !credentials.workspaceId) {
         throw new InfraError(
           'invalid_request',
-          'Railway workload provisioning requires either (projectId + environmentId) or workspaceId',
+          'Railway workload provisioning requires either (projectId + environmentId), projectId, or workspaceId',
           { provider: 'railway' },
         );
       }
       const ensured = await ensureRailwayProject(
         token,
-        credentials.workspaceId,
+        credentials.workspaceId ?? '',
         spec.name,
         { projectId, environmentId },
         credentials.apiUrl,
@@ -143,6 +142,7 @@ export const railwayWorkloadDriver: WorkloadDriver = {
       token,
       serviceId,
       environmentId,
+      {},
       credentials.apiUrl,
     );
 
@@ -162,7 +162,6 @@ export const railwayWorkloadDriver: WorkloadDriver = {
       provider: 'railway',
       workloadId: serviceId,
       name: spec.name,
-      region: spec.region,
       url,
       memoryMb: spec.memoryMb,
       vcpus: spec.vcpus,
@@ -203,6 +202,7 @@ export const railwayWorkloadDriver: WorkloadDriver = {
       token,
       handle.workloadId,
       environmentId,
+      {},
       credentials.apiUrl,
     );
     return {
@@ -241,16 +241,17 @@ export const railwayWorkloadDriver: WorkloadDriver = {
     credentials: WorkloadCredentials,
     handle: WorkloadHandle,
   ): Promise<WorkloadUsage> => {
-    const status = await railwayWorkloadDriver.fetchWorkloadStatus(credentials, handle);
+    await railwayWorkloadDriver.fetchWorkloadStatus(credentials, handle);
     const nowIso = new Date().toISOString();
     return {
       provider: 'railway',
       workloadId: handle.workloadId,
       memoryMb: handle.memoryMb ?? 0,
       vcpus: handle.vcpus ?? 0,
-      activeSeconds: status.state === 'running' ? 60 : 0,
-      suspendedSeconds: status.state === 'suspended' || status.state === 'stopped' ? 60 : 0,
+      activeSeconds: 0,
+      suspendedSeconds: 0,
       rootfsGb: 0,
+      metered: false,
       windowStartIso: nowIso,
       windowEndIso: nowIso,
     };

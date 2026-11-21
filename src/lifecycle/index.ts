@@ -10,6 +10,7 @@ export {
   type WorkloadLifecyclePolicyOptions,
 } from './lifecyclePolicy.ts';
 export {
+  type WarmRetentionMode,
   WORKLOAD_CLASSES,
   WORKLOAD_LIFECYCLE_STATES,
   type WorkingHoursSchedule,

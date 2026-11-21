@@ -1,39 +1,14 @@
 {
-  "$schema": "https://biomejs.dev/schemas/2.5.2/schema.json",
-  "vcs": { "enabled": true, "clientKind": "git", "useIgnoreFile": true },
-  "files": {
-    "ignoreUnknown": false,
-    "includes": ["**", "!**/dist", "!**/node_modules"]
-  },
-  "formatter": {
-    "enabled": true,
-    "indentStyle": "space",
-    "indentWidth": 2,
-    "lineWidth": 100
-  },
-  "assist": { "actions": { "source": { "organizeImports": "on" } } },
+  "extends": ["@inixiative/config/biome/base.json"],
   "linter": {
-    "enabled": true,
     "rules": {
-      "recommended": true,
-      "correctness": {
-        "noUnusedVariables": "error"
-      },
       "suspicious": {
         "noExplicitAny": "error",
-        "noImplicitAnyLet": "error",
-        "noThenProperty": "off"
+        "noImplicitAnyLet": "error"
       },
       "style": {
         "noNonNullAssertion": "error"
       }
-    }
-  },
-  "javascript": {
-    "formatter": {
-      "quoteStyle": "single",
-      "trailingCommas": "all",
-      "semicolons": "always"
     }
   }
 }

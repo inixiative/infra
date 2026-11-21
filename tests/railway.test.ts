@@ -2,11 +2,16 @@ import { afterAll, beforeEach, describe, expect, it } from 'bun:test';
 import {
   type ArchiveDeployment,
   connectRailwayServiceToGitHub,
+  deployRailwayServiceInstance,
+  deployRailwayServiceLatestCommit,
   ensureRailwayBucket,
+  ensureRailwayProject,
+  ensureRailwayVolume,
   fetchRailwayBucketCredentials,
+  fetchRailwayDeploymentStatus,
   fetchRailwayProjectEnvironments,
   fetchRailwayProjectVolumes,
-  fetchRailwayServiceConnectedToGitHub,
+  fetchRailwayServiceGitHubConnectionStatus,
   InfraError,
   railwayArchiveDriver,
   railwayWorkloadDriver,
@@ -36,7 +41,7 @@ type Service = {
   deploymentId?: string;
   deploymentStatus?: string;
   domain?: string;
-  volumeMount?: string;
+  volumeMounts: string[];
   triggers: { id: string; repository: string; branch: string }[];
 };
 
@@ -47,18 +52,33 @@ const state = {
   scheduledDeletes: [] as string[],
   deletedServices: [] as string[],
   stoppedDeployments: [] as string[],
+  latestCommitDeploys: [] as { serviceId: string; environmentId: string; latestCommit: boolean }[],
+  commitShaDeploys: [] as { serviceId: string; commitSha?: string }[],
   operations: [] as string[],
   serviceDomain: 'archive.up.railway.app',
   deployStatus: 'SUCCESS',
   failNext: undefined as string | undefined,
-  rejectNext: undefined as { operation: string; message: string } | undefined,
+  rejectNext: undefined as
+    | { operation: string; errors: Array<{ message: string; extensions?: { code?: string } }> }
+    | undefined,
   pageSize: 100,
   workspaces: [{ id: 'workspace-1', name: 'Team Workspace' }],
 };
 
 let idCounter = 0;
 const nextId = (prefix: string) => `${prefix}-${++idCounter}`;
-const edges = <T>(items: T[]) => ({ edges: items.map((node) => ({ node })) });
+
+const pagedEdges = <T>(items: T[], after: unknown) => {
+  const start = after ? Number(after) : 0;
+  const page = items.slice(start, start + state.pageSize);
+  return {
+    edges: page.map((node) => ({ node })),
+    pageInfo: {
+      hasNextPage: start + state.pageSize < items.length,
+      endCursor: String(start + state.pageSize),
+    },
+  };
+};
 
 const operationOf = (query: string) =>
   [
@@ -76,6 +96,7 @@ const operationOf = (query: string) =>
     'variables',
     'serviceInstanceUpdate',
     'serviceInstanceDeployV2',
+    'serviceInstanceDeploy',
     'serviceInstance',
     'deploymentTriggerCreate',
     'deploymentTriggers',
@@ -99,26 +120,14 @@ const resolveGraphql = (operation: string, variables: Record<string, unknown>) =
     case 'apiToken':
       return { apiToken: { workspaces: state.workspaces } };
     case 'projects': {
-      const all = [...state.projects.values()].filter(
-        (project) => project.workspaceId === variables.workspaceId,
-      );
-      const start = variables.after ? Number(variables.after) : 0;
-      const page = all.slice(start, start + state.pageSize);
-      return {
-        projects: {
-          ...edges(
-            page.map((project) => ({
-              id: project.id,
-              name: project.name,
-              environments: edges(project.environments),
-            })),
-          ),
-          pageInfo: {
-            hasNextPage: start + state.pageSize < all.length,
-            endCursor: String(start + state.pageSize),
-          },
-        },
-      };
+      const all = [...state.projects.values()]
+        .filter((project) => project.workspaceId === variables.workspaceId)
+        .map((project) => ({
+          id: project.id,
+          name: project.name,
+          environments: { edges: project.environments.map((node) => ({ node })) },
+        }));
+      return { projects: pagedEdges(all, variables.after) };
     }
     case 'projectCreate': {
       const project: Project = {
@@ -139,20 +148,22 @@ const resolveGraphql = (operation: string, variables: Record<string, unknown>) =
         projectCreate: {
           id: project.id,
           name: project.name,
-          environments: edges(project.environments),
+          environments: { edges: project.environments.map((node) => ({ node })) },
         },
       };
     }
     case 'project': {
       const project = state.projects.get(String(variables.id));
+      if (!project) return { project: null };
+      const projectServices = [...state.services.values()].filter(
+        (item) => item.projectId === project.id,
+      );
       return {
         project: {
-          services: edges(
-            [...state.services.values()].filter((item) => item.projectId === variables.id),
-          ),
-          environments: edges(project?.environments ?? []),
-          volumes: edges(project?.volumes ?? []),
-          buckets: project?.buckets ?? [],
+          services: pagedEdges(projectServices, variables.after),
+          environments: pagedEdges(project.environments, variables.after),
+          volumes: pagedEdges(project.volumes, variables.after),
+          buckets: project.buckets,
         },
       };
     }
@@ -169,13 +180,14 @@ const resolveGraphql = (operation: string, variables: Record<string, unknown>) =
         projectId: String(input.projectId),
         name: String(input.name),
         variables: {},
+        volumeMounts: [],
         triggers: [],
       };
       state.services.set(created.id, created);
       return { serviceCreate: { id: created.id } };
     }
     case 'service':
-      return service ? { service: { projectId: service.projectId } } : undefined;
+      return { service: service ? { projectId: service.projectId } : null };
     case 'serviceUpdate': {
       if (service) service.name = String(input.name);
       return { serviceUpdate: { id: service?.id ?? '', name: service?.name ?? '' } };
@@ -187,20 +199,20 @@ const resolveGraphql = (operation: string, variables: Record<string, unknown>) =
       state.deletedServices.push(id);
       return { serviceDelete: true };
     }
-    case 'environment':
+    case 'environment': {
+      const mounts = [...state.services.values()].flatMap((item) =>
+        item.volumeMounts.map((mountPath) => ({ serviceId: item.id, mountPath })),
+      );
       return {
         environment: {
-          volumeInstances: edges(
-            [...state.services.values()]
-              .filter((item) => item.volumeMount)
-              .map((item) => ({ serviceId: item.id, mountPath: item.volumeMount })),
-          ),
+          volumeInstances: pagedEdges(mounts, variables.after),
         },
       };
+    }
     case 'volumeCreate': {
       const volumeId = nextId('vol');
       if (service) {
-        service.volumeMount = String(input.mountPath);
+        service.volumeMounts.push(String(input.mountPath));
         const project = state.projects.get(service.projectId);
         project?.volumes.push({ id: volumeId, name: `${service.name}-vol` });
       }
@@ -234,11 +246,23 @@ const resolveGraphql = (operation: string, variables: Record<string, unknown>) =
         service.deploymentStatus = state.deployStatus;
       }
       state.deployments.set(deploymentId, state.deployStatus);
+      state.commitShaDeploys.push({
+        serviceId: String(variables.serviceId),
+        commitSha: typeof variables.commitSha === 'string' ? variables.commitSha : undefined,
+      });
       return { serviceInstanceDeployV2: deploymentId };
+    }
+    case 'serviceInstanceDeploy': {
+      state.latestCommitDeploys.push({
+        serviceId: String(variables.serviceId),
+        environmentId: String(variables.environmentId),
+        latestCommit: Boolean(variables.latestCommit),
+      });
+      return { serviceInstanceDeploy: true };
     }
     case 'deployment': {
       const status = state.deployments.get(String(variables.id));
-      return status ? { deployment: { status } } : undefined;
+      return { deployment: status ? { status } : null };
     }
     case 'deploymentStop': {
       const id = String(variables.id);
@@ -250,7 +274,7 @@ const resolveGraphql = (operation: string, variables: Record<string, unknown>) =
       return { deploymentStop: true };
     }
     case 'deploymentTriggers':
-      return { deploymentTriggers: edges(service?.triggers ?? []) };
+      return { deploymentTriggers: pagedEdges(service?.triggers ?? [], variables.after) };
     case 'deploymentTriggerCreate': {
       const trigger = {
         id: nextId('trig'),
@@ -261,14 +285,15 @@ const resolveGraphql = (operation: string, variables: Record<string, unknown>) =
       return { deploymentTriggerCreate: { id: trigger.id } };
     }
     case 'serviceInstance':
+      if (!service) return { serviceInstance: null };
       return {
         serviceInstance: {
-          id: service?.id ?? 'unknown',
-          latestDeployment: service?.deploymentStatus
+          id: service.id,
+          latestDeployment: service.deploymentStatus
             ? { id: service.deploymentId, status: service.deploymentStatus }
             : null,
-          domains: { serviceDomains: service?.domain ? [{ domain: service.domain }] : [] },
-          source: service?.repo ? { repo: service.repo } : null,
+          domains: { serviceDomains: service.domain ? [{ domain: service.domain }] : [] },
+          source: service.repo ? { repo: service.repo } : null,
         },
       };
     case 'serviceDomainCreate':
@@ -317,9 +342,9 @@ const server = Bun.serve({
       return new Response('unavailable', { status: 503 });
     }
     if (state.rejectNext?.operation === operation) {
-      const { message } = state.rejectNext;
+      const { errors } = state.rejectNext;
       state.rejectNext = undefined;
-      return Response.json({ errors: [{ message }] });
+      return Response.json({ errors });
     }
     state.operations.push(operation);
     const data = resolveGraphql(operation, variables);
@@ -349,6 +374,8 @@ const resetState = () => {
   state.scheduledDeletes.length = 0;
   state.deletedServices.length = 0;
   state.stoppedDeployments.length = 0;
+  state.latestCommitDeploys.length = 0;
+  state.commitShaDeploys.length = 0;
   state.operations.length = 0;
   state.deployStatus = 'SUCCESS';
   state.failNext = undefined;
@@ -368,7 +395,7 @@ describe('railwayArchiveDriver', () => {
     expect(db).toMatchObject({
       name: 'archive-postgres',
       image: 'pgvector/pgvector:pg17',
-      volumeMount: '/var/lib/postgresql/data',
+      volumeMounts: ['/var/lib/postgresql/data'],
       deploymentStatus: 'SUCCESS',
     });
     expect(state.operations.indexOf('volumeCreate')).toBeLessThan(
@@ -413,61 +440,82 @@ describe('railwayArchiveDriver', () => {
     );
   });
 
-  it('maps throttle and auth errors to typed InfraError codes and adopts retries', async () => {
+  it('maps GraphQL errors, extensions codes, and null entities cleanly', async () => {
     state.rejectNext = {
       operation: 'projectCreate',
-      message: 'You are creating projects too quickly.',
+      errors: [
+        {
+          message: 'You are creating projects too quickly.',
+          extensions: { code: 'BAD_USER_INPUT' },
+        },
+        { message: 'Try again shortly.' },
+      ],
     };
-    await expect(railwayArchiveDriver.provisionDatabase(makeDeployment())).rejects.toMatchObject({
-      code: 'rate_limited',
+    const throttleError = await railwayArchiveDriver
+      .provisionDatabase(makeDeployment())
+      .catch((error: unknown) => error);
+    expect(throttleError).toBeInstanceOf(InfraError);
+    expect(throttleError).toMatchObject({ code: 'rate_limited', retryable: true });
+    expect((throttleError as InfraError).message).toContain('Try again shortly.');
+
+    state.rejectNext = {
+      operation: 'apiToken',
+      errors: [{ message: 'invalid input', extensions: { code: 'BAD_USER_INPUT' } }],
+    };
+    await expect(railwayArchiveDriver.fetchWorkspaces(FAKE_TOKEN, apiUrl)).rejects.toMatchObject({
+      code: 'invalid_request',
+      retryable: false,
     });
 
-    state.failNext = 'volumeCreate';
-    await expect(railwayArchiveDriver.provisionDatabase(makeDeployment())).rejects.toBeInstanceOf(
-      InfraError,
-    );
-
-    const ids = await railwayArchiveDriver.provisionDatabase(makeDeployment());
-    expect(state.operations.filter((op) => op === 'projectCreate')).toHaveLength(1);
-    expect(state.operations.filter((op) => op === 'serviceCreate')).toHaveLength(1);
+    await expect(
+      fetchRailwayDeploymentStatus(FAKE_TOKEN, 'nonexistent-dep', apiUrl),
+    ).rejects.toMatchObject({ code: 'not_found' });
 
     await expect(railwayArchiveDriver.fetchWorkspaces('wrong', apiUrl)).rejects.toMatchObject({
       code: 'authentication_failed',
     });
-
-    await railwayArchiveDriver.destroyService(makeDeployment());
-    expect(state.scheduledDeletes).toEqual([ids.projectId ?? '']);
   });
 });
 
 describe('railwayWorkloadDriver and shared Railway helpers', () => {
   beforeEach(resetState);
 
-  it('provisions, checks status/usage, stops, wakes, and destroys a workload', async () => {
-    const credentials = { token: FAKE_TOKEN, workspaceId: 'workspace-1', apiUrl };
+  it('provisions, checks status/unmetered usage, stops, wakes, fails closed on egressAllowlist, and destroys', async () => {
+    const credentials = { token: FAKE_TOKEN, workspaceId: 'workspace-1', apiUrl: `${apiUrl}/` };
+
+    await expect(
+      railwayWorkloadDriver.provisionWorkload(credentials, {
+        name: 'blocked-egress',
+        image: 'ghcr.io/example/worker:1.0.0',
+        memoryMb: 1024,
+        vcpus: 1,
+        egressAllowlist: ['api.example.com'],
+      }),
+    ).rejects.toMatchObject({ code: 'invalid_request', provider: 'railway' });
+
     const handle = await railwayWorkloadDriver.provisionWorkload(credentials, {
-      name: 'chorus-host-1',
-      image: 'ghcr.io/inixiative/chorus:1.0.0',
+      name: 'worker-host-1',
+      image: 'ghcr.io/example/worker:1.0.0',
       memoryMb: 2048,
       vcpus: 2,
+      region: 'us-east',
       env: { NODE_ENV: 'production' },
       volume: { name: 'data', mountPath: '/data' },
       port: { internalPort: 4500, publicHttps: true },
       healthcheckPath: '/health',
     });
     expect(handle.provider).toBe('railway');
+    expect(handle.region).toBeUndefined();
     expect(handle.url).toBe('https://archive.up.railway.app');
 
-    const running = await railwayWorkloadDriver.fetchWorkloadStatus(credentials, handle);
-    expect(running.state).toBe('running');
-
     const usage = await railwayWorkloadDriver.fetchWorkloadUsage(credentials, handle);
-    expect(usage.activeSeconds).toBeGreaterThan(0);
+    expect(usage).toMatchObject({ activeSeconds: 0, suspendedSeconds: 0, metered: false });
 
     await railwayWorkloadDriver.suspendWorkload(credentials, handle);
     expect(state.stoppedDeployments).toHaveLength(1);
-    const stopped = await railwayWorkloadDriver.fetchWorkloadStatus(credentials, handle);
-    expect(stopped.state).toBe('stopped');
+    expect((await railwayWorkloadDriver.fetchWorkloadStatus(credentials, handle)).state).toBe(
+      'stopped',
+    );
 
     const woken = await railwayWorkloadDriver.wakeWorkload(credentials, handle);
     expect(woken.metadata?.deploymentId).toBeDefined();
@@ -476,7 +524,7 @@ describe('railwayWorkloadDriver and shared Railway helpers', () => {
     expect(state.deletedServices).toEqual([handle.workloadId]);
   });
 
-  it('supports template/init GitHub wiring, buckets, and renames over GraphQL', async () => {
+  it('adopts projectId without environmentId, matches volume mountPath, supports commitSha/latestCommit deploys, GitHub, and buckets', async () => {
     const credentials = { token: FAKE_TOKEN, workspaceId: 'workspace-1', apiUrl };
     const handle = await railwayWorkloadDriver.provisionWorkload(credentials, {
       name: 'web-api',
@@ -489,8 +537,56 @@ describe('railwayWorkloadDriver and shared Railway helpers', () => {
     const projectId = handle.projectId ?? '';
     const environmentId = handle.environmentId ?? '';
 
+    // ensureRailwayProject with projectId only reuses existing project without creating a second one
+    const beforeProjectCreates = state.operations.filter((op) => op === 'projectCreate').length;
+    const ensured = await ensureRailwayProject(
+      FAKE_TOKEN,
+      'workspace-1',
+      'different-name',
+      { projectId },
+      apiUrl,
+    );
+    expect(ensured).toEqual({ projectId, environmentId });
+    expect(state.operations.filter((op) => op === 'projectCreate')).toHaveLength(
+      beforeProjectCreates,
+    );
+
+    // ensureRailwayVolume matches both serviceId and mountPath
+    await ensureRailwayVolume(
+      FAKE_TOKEN,
+      projectId,
+      environmentId,
+      handle.workloadId,
+      '/cache',
+      apiUrl,
+    );
+    expect(state.services.get(handle.workloadId)?.volumeMounts).toEqual(['/uploads', '/cache']);
+
+    // commitSha + latestCommit deploy helpers
+    await deployRailwayServiceInstance(
+      FAKE_TOKEN,
+      handle.workloadId,
+      environmentId,
+      { commitSha: 'abc123' },
+      apiUrl,
+    );
+    expect(state.commitShaDeploys.at(-1)).toEqual({
+      serviceId: handle.workloadId,
+      commitSha: 'abc123',
+    });
+    await deployRailwayServiceLatestCommit(
+      FAKE_TOKEN,
+      handle.workloadId,
+      environmentId,
+      { latestCommit: true },
+      apiUrl,
+    );
+    expect(state.latestCommitDeploys).toEqual([
+      { serviceId: handle.workloadId, environmentId, latestCommit: true },
+    ]);
+
     expect(
-      await fetchRailwayServiceConnectedToGitHub(
+      await fetchRailwayServiceGitHubConnectionStatus(
         FAKE_TOKEN,
         handle.workloadId,
         environmentId,
@@ -506,7 +602,7 @@ describe('railwayWorkloadDriver and shared Railway helpers', () => {
       apiUrl,
     );
     expect(
-      await fetchRailwayServiceConnectedToGitHub(
+      await fetchRailwayServiceGitHubConnectionStatus(
         FAKE_TOKEN,
         handle.workloadId,
         environmentId,

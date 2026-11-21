@@ -1,9 +1,10 @@
 import type { HostingWorkspace } from '../core/contracts.ts';
-import { InfraError, isInfraError } from '../core/infraError.ts';
+import { InfraError, ignoreNotFound, requireNonEmpty } from '../core/infraError.ts';
 import { sendRailwayGraphql } from './railwayRequest.ts';
 
 type RailwayEdges<T> = { readonly edges: ReadonlyArray<{ readonly node: T }> };
-type RailwayPageInfo = { readonly hasNextPage: boolean; readonly endCursor: string | null };
+type RailwayPageInfo = { readonly hasNextPage?: boolean; readonly endCursor?: string | null };
+type RailwayConnection<T> = RailwayEdges<T> & { readonly pageInfo?: RailwayPageInfo };
 
 export type RailwayNamedResource = { readonly id: string; readonly name: string };
 
@@ -38,13 +39,36 @@ export type RailwayBucketCredentials = {
 const edgeNodes = <T>(connection: RailwayEdges<T> | null | undefined): T[] =>
   connection?.edges.map((edge) => edge.node) ?? [];
 
-const requireRailwayValue = (value: string | undefined, label: string): string => {
-  if (!value) {
-    throw new InfraError('invalid_request', `Missing required Railway ${label}`, {
-      provider: 'railway',
-    });
+const requireEntity = <T>(entity: T | null | undefined, label: string): T => {
+  if (entity === null || entity === undefined) {
+    throw new InfraError('not_found', `Railway ${label} not found`, { provider: 'railway' });
   }
-  return value;
+  return entity;
+};
+
+const paginateConnection = async <T>(
+  fetchPage: (after: string | null) => Promise<RailwayConnection<T>>,
+): Promise<T[]> => {
+  const results: T[] = [];
+  const seenCursors = new Set<string>();
+  let after: string | null = null;
+  do {
+    const connection = await fetchPage(after);
+    results.push(...edgeNodes(connection));
+    const nextCursor = connection.pageInfo?.hasNextPage
+      ? (connection.pageInfo.endCursor ?? null)
+      : null;
+    if (nextCursor !== null) {
+      if (seenCursors.has(nextCursor)) {
+        throw new InfraError('provider_unavailable', 'Railway pagination cursor repeated', {
+          provider: 'railway',
+        });
+      }
+      seenCursors.add(nextCursor);
+    }
+    after = nextCursor;
+  } while (after !== null);
+  return results;
 };
 
 export const fetchRailwayWorkspaces = async (
@@ -72,12 +96,13 @@ export const fetchRailwayProjectByName = async (
   name: string,
   apiUrl?: string,
 ): Promise<RailwayProjectSummary | undefined> => {
+  const seenCursors = new Set<string>();
   let after: string | null = null;
   do {
     const response: {
-      projects: RailwayEdges<RailwayProjectNode> & { pageInfo: RailwayPageInfo };
+      projects: RailwayConnection<RailwayProjectNode>;
     } = await sendRailwayGraphql<{
-      projects: RailwayEdges<RailwayProjectNode> & { pageInfo: RailwayPageInfo };
+      projects: RailwayConnection<RailwayProjectNode>;
     }>(
       token,
       'query($workspaceId: String, $after: String) { projects(workspaceId: $workspaceId, first: 100, after: $after) { edges { node { id name environments { edges { node { id name } } } } } pageInfo { hasNextPage endCursor } } }',
@@ -93,8 +118,23 @@ export const fetchRailwayProjectByName = async (
         environments: edgeNodes(match.environments),
       };
     }
-    after = projects.pageInfo.hasNextPage ? projects.pageInfo.endCursor : null;
-  } while (after);
+    const nextCursor = projects.pageInfo?.hasNextPage
+      ? (projects.pageInfo.endCursor ?? null)
+      : null;
+    if (nextCursor !== null) {
+      if (seenCursors.has(nextCursor)) {
+        throw new InfraError(
+          'provider_unavailable',
+          'Railway projects pagination cursor repeated',
+          {
+            provider: 'railway',
+          },
+        );
+      }
+      seenCursors.add(nextCursor);
+    }
+    after = nextCursor;
+  } while (after !== null);
   return undefined;
 };
 
@@ -118,6 +158,23 @@ export const createRailwayProject = async (
   };
 };
 
+export const fetchRailwayProjectEnvironments = async (
+  token: string,
+  projectId: string,
+  apiUrl?: string,
+): Promise<RailwayNamedResource[]> =>
+  paginateConnection(async (after) => {
+    const { project } = await sendRailwayGraphql<{
+      project: { environments: RailwayConnection<RailwayNamedResource> } | null;
+    }>(
+      token,
+      'query($id: String!, $after: String) { project(id: $id) { environments(first: 100, after: $after) { edges { node { id name } } pageInfo { hasNextPage endCursor } } } }',
+      { id: projectId, after },
+      apiUrl,
+    );
+    return requireEntity(project, `project ${projectId}`).environments;
+  });
+
 export const ensureRailwayProject = async (
   token: string,
   workspaceId: string,
@@ -128,6 +185,19 @@ export const ensureRailwayProject = async (
   if (existingIds?.projectId && existingIds?.environmentId) {
     return { projectId: existingIds.projectId, environmentId: existingIds.environmentId };
   }
+  if (existingIds?.projectId) {
+    const environments = await fetchRailwayProjectEnvironments(
+      token,
+      existingIds.projectId,
+      apiUrl,
+    );
+    const environment =
+      environments.find((candidate) => candidate.name === 'production') ?? environments[0];
+    return {
+      projectId: existingIds.projectId,
+      environmentId: requireNonEmpty(environment?.id, 'Railway environmentId', 'railway'),
+    };
+  }
   const project =
     (await fetchRailwayProjectByName(token, workspaceId, name, apiUrl)) ??
     (await createRailwayProject(token, workspaceId, name, 'production', apiUrl));
@@ -136,24 +206,8 @@ export const ensureRailwayProject = async (
     project.environments[0];
   return {
     projectId: project.id,
-    environmentId: requireRailwayValue(environment?.id, 'environmentId'),
+    environmentId: requireNonEmpty(environment?.id, 'Railway environmentId', 'railway'),
   };
-};
-
-export const fetchRailwayProjectEnvironments = async (
-  token: string,
-  projectId: string,
-  apiUrl?: string,
-): Promise<RailwayNamedResource[]> => {
-  const { project } = await sendRailwayGraphql<{
-    project: { environments: RailwayEdges<RailwayNamedResource> };
-  }>(
-    token,
-    'query($id: String!) { project(id: $id) { environments { edges { node { id name } } } } }',
-    { id: projectId },
-    apiUrl,
-  );
-  return edgeNodes(project.environments);
 };
 
 export const renameRailwayEnvironment = async (
@@ -178,15 +232,18 @@ export const ensureRailwayService = async (
   name: string,
   apiUrl?: string,
 ): Promise<string> => {
-  const { project } = await sendRailwayGraphql<{
-    project: { services: RailwayEdges<RailwayNamedResource> };
-  }>(
-    token,
-    'query($id: String!) { project(id: $id) { services { edges { node { id name } } } } }',
-    { id: projectId },
-    apiUrl,
-  );
-  const existing = edgeNodes(project.services).find((service) => service.name === name);
+  const services = await paginateConnection(async (after) => {
+    const { project } = await sendRailwayGraphql<{
+      project: { services: RailwayConnection<RailwayNamedResource> } | null;
+    }>(
+      token,
+      'query($id: String!, $after: String) { project(id: $id) { services(first: 100, after: $after) { edges { node { id name } } pageInfo { hasNextPage endCursor } } } }',
+      { id: projectId, after },
+      apiUrl,
+    );
+    return requireEntity(project, `project ${projectId}`).services;
+  });
+  const existing = services.find((service) => service.name === name);
   if (existing) return existing.id;
   const { serviceCreate } = await sendRailwayGraphql<{ serviceCreate: { id: string } }>(
     token,
@@ -234,7 +291,7 @@ export const updateRailwayServiceInstance = async (
   }
 };
 
-export const fetchRailwayServiceConnectedToGitHub = async (
+export const fetchRailwayServiceGitHubConnectionStatus = async (
   token: string,
   serviceId: string,
   environmentId: string,
@@ -248,7 +305,7 @@ export const fetchRailwayServiceConnectedToGitHub = async (
     { serviceId, environmentId },
     apiUrl,
   );
-  return Boolean(serviceInstance?.source?.repo);
+  return Boolean(requireEntity(serviceInstance, `serviceInstance ${serviceId}`).source?.repo);
 };
 
 export const connectRailwayServiceToGitHub = async (
@@ -261,24 +318,27 @@ export const connectRailwayServiceToGitHub = async (
 ): Promise<void> => {
   await updateRailwayServiceInstance(token, serviceId, environmentId, { source: { repo } }, apiUrl);
 
-  const { service } = await sendRailwayGraphql<{ service: { projectId: string } }>(
+  const { service } = await sendRailwayGraphql<{ service: { projectId: string } | null }>(
     token,
     'query($id: String!) { service(id: $id) { projectId } }',
     { id: serviceId },
     apiUrl,
   );
-  const projectId = service.projectId;
+  const projectId = requireEntity(service, `service ${serviceId}`).projectId;
 
-  const { deploymentTriggers } = await sendRailwayGraphql<{
-    deploymentTriggers: RailwayEdges<{ id: string; branch: string; repository: string }>;
-  }>(
-    token,
-    'query($projectId: String!, $serviceId: String!, $environmentId: String!) { deploymentTriggers(projectId: $projectId, serviceId: $serviceId, environmentId: $environmentId) { edges { node { id branch repository } } } }',
-    { projectId, serviceId, environmentId },
-    apiUrl,
-  );
+  const triggers = await paginateConnection(async (after) => {
+    const { deploymentTriggers } = await sendRailwayGraphql<{
+      deploymentTriggers: RailwayConnection<{ id: string; branch: string; repository: string }>;
+    }>(
+      token,
+      'query($projectId: String!, $serviceId: String!, $environmentId: String!, $after: String) { deploymentTriggers(projectId: $projectId, serviceId: $serviceId, environmentId: $environmentId, first: 100, after: $after) { edges { node { id branch repository } } pageInfo { hasNextPage endCursor } } }',
+      { projectId, serviceId, environmentId, after },
+      apiUrl,
+    );
+    return deploymentTriggers;
+  });
 
-  const hasTrigger = edgeNodes(deploymentTriggers).some(
+  const hasTrigger = triggers.some(
     (trigger) => trigger.repository === repo && trigger.branch === branch,
   );
   if (!hasTrigger) {
@@ -305,17 +365,18 @@ export const fetchRailwayProjectVolumes = async (
   token: string,
   projectId: string,
   apiUrl?: string,
-): Promise<RailwayNamedResource[]> => {
-  const { project } = await sendRailwayGraphql<{
-    project: { volumes: RailwayEdges<RailwayNamedResource> };
-  }>(
-    token,
-    'query($id: String!) { project(id: $id) { volumes { edges { node { id name } } } } }',
-    { id: projectId },
-    apiUrl,
-  );
-  return edgeNodes(project.volumes);
-};
+): Promise<RailwayNamedResource[]> =>
+  paginateConnection(async (after) => {
+    const { project } = await sendRailwayGraphql<{
+      project: { volumes: RailwayConnection<RailwayNamedResource> } | null;
+    }>(
+      token,
+      'query($id: String!, $after: String) { project(id: $id) { volumes(first: 100, after: $after) { edges { node { id name } } pageInfo { hasNextPage endCursor } } } }',
+      { id: projectId, after },
+      apiUrl,
+    );
+    return requireEntity(project, `project ${projectId}`).volumes;
+  });
 
 export const ensureRailwayVolume = async (
   token: string,
@@ -325,15 +386,20 @@ export const ensureRailwayVolume = async (
   mountPath: string,
   apiUrl?: string,
 ): Promise<void> => {
-  const { environment } = await sendRailwayGraphql<{
-    environment: { volumeInstances: RailwayEdges<{ serviceId: string | null; mountPath: string }> };
-  }>(
-    token,
-    'query($id: String!, $projectId: String) { environment(id: $id, projectId: $projectId) { volumeInstances { edges { node { serviceId mountPath } } } } }',
-    { id: environmentId, projectId },
-    apiUrl,
-  );
-  if (edgeNodes(environment.volumeInstances).some((volume) => volume.serviceId === serviceId)) {
+  const volumes = await paginateConnection(async (after) => {
+    const { environment } = await sendRailwayGraphql<{
+      environment: {
+        volumeInstances: RailwayConnection<{ serviceId: string | null; mountPath: string }>;
+      } | null;
+    }>(
+      token,
+      'query($id: String!, $projectId: String, $after: String) { environment(id: $id, projectId: $projectId) { volumeInstances(first: 100, after: $after) { edges { node { serviceId mountPath } } pageInfo { hasNextPage endCursor } } } }',
+      { id: environmentId, projectId, after },
+      apiUrl,
+    );
+    return requireEntity(environment, `environment ${environmentId}`).volumeInstances;
+  });
+  if (volumes.some((volume) => volume.serviceId === serviceId && volume.mountPath === mountPath)) {
     return;
   }
   await sendRailwayGraphql(
@@ -411,17 +477,18 @@ export const fetchRailwayServiceInstance = async (
       latestDeployment: { id?: string; status: string } | null;
       domains: { serviceDomains: { domain: string }[] };
       source?: { repo?: string | null } | null;
-    };
+    } | null;
   }>(
     token,
     'query($serviceId: String!, $environmentId: String!) { serviceInstance(serviceId: $serviceId, environmentId: $environmentId) { latestDeployment { id status } domains { serviceDomains { domain } } source { repo } } }',
     { serviceId, environmentId },
     apiUrl,
   );
+  const instance = requireEntity(serviceInstance, `serviceInstance ${serviceId}`);
   return {
-    latestDeployment: serviceInstance.latestDeployment,
-    domains: serviceInstance.domains.serviceDomains.map((entry) => entry.domain),
-    sourceRepo: serviceInstance.source?.repo,
+    latestDeployment: instance.latestDeployment,
+    domains: instance.domains.serviceDomains.map((entry) => entry.domain),
+    sourceRepo: instance.source?.repo,
   };
 };
 
@@ -429,15 +496,44 @@ export const deployRailwayServiceInstance = async (
   token: string,
   serviceId: string,
   environmentId: string,
+  options: { readonly commitSha?: string } = {},
   apiUrl?: string,
 ): Promise<string> => {
+  const query = options.commitSha
+    ? 'mutation($serviceId: String!, $environmentId: String!, $commitSha: String) { serviceInstanceDeployV2(serviceId: $serviceId, environmentId: $environmentId, commitSha: $commitSha) }'
+    : 'mutation($serviceId: String!, $environmentId: String!) { serviceInstanceDeployV2(serviceId: $serviceId, environmentId: $environmentId) }';
+  const variables = options.commitSha
+    ? { serviceId, environmentId, commitSha: options.commitSha }
+    : { serviceId, environmentId };
   const { serviceInstanceDeployV2 } = await sendRailwayGraphql<{ serviceInstanceDeployV2: string }>(
     token,
-    'mutation($serviceId: String!, $environmentId: String!) { serviceInstanceDeployV2(serviceId: $serviceId, environmentId: $environmentId) }',
-    { serviceId, environmentId },
+    query,
+    variables,
     apiUrl,
   );
-  return requireRailwayValue(serviceInstanceDeployV2, 'deploymentId');
+  return requireNonEmpty(serviceInstanceDeployV2, 'Railway deploymentId', 'railway');
+};
+
+export const deployRailwayServiceLatestCommit = async (
+  token: string,
+  serviceId: string,
+  environmentId: string,
+  options: { readonly latestCommit?: boolean } = {},
+  apiUrl?: string,
+): Promise<void> => {
+  const { serviceInstanceDeploy } = await sendRailwayGraphql<{ serviceInstanceDeploy: boolean }>(
+    token,
+    'mutation($serviceId: String!, $environmentId: String!, $latestCommit: Boolean!) { serviceInstanceDeploy(serviceId: $serviceId, environmentId: $environmentId, latestCommit: $latestCommit) }',
+    { serviceId, environmentId, latestCommit: options.latestCommit ?? true },
+    apiUrl,
+  );
+  if (!serviceInstanceDeploy) {
+    throw new InfraError(
+      'provider_unavailable',
+      `Failed to deploy latest commit for Railway service ${serviceId}`,
+      { provider: 'railway' },
+    );
+  }
 };
 
 export const fetchRailwayDeploymentStatus = async (
@@ -445,13 +541,13 @@ export const fetchRailwayDeploymentStatus = async (
   deploymentId: string,
   apiUrl?: string,
 ): Promise<string> => {
-  const { deployment } = await sendRailwayGraphql<{ deployment: { status: string } }>(
+  const { deployment } = await sendRailwayGraphql<{ deployment: { status: string } | null }>(
     token,
     'query($id: String!) { deployment(id: $id) { status } }',
     { id: deploymentId },
     apiUrl,
   );
-  return deployment.status;
+  return requireEntity(deployment, `deployment ${deploymentId}`).status;
 };
 
 export const stopRailwayDeployment = async (
@@ -502,14 +598,14 @@ export const fetchRailwayProjectBuckets = async (
   apiUrl?: string,
 ): Promise<RailwayNamedResource[]> => {
   const { project } = await sendRailwayGraphql<{
-    project: { buckets?: RailwayNamedResource[] | null };
+    project: { buckets?: RailwayNamedResource[] | null } | null;
   }>(
     token,
     'query($id: String!) { project(id: $id) { buckets { id name } } }',
     { id: projectId },
     apiUrl,
   );
-  return project.buckets ?? [];
+  return requireEntity(project, `project ${projectId}`).buckets ?? [];
 };
 
 export const createRailwayBucket = async (
@@ -589,9 +685,7 @@ export const deleteRailwayService = async (
     'mutation($id: String!) { serviceDelete(id: $id) }',
     { id: serviceId },
     apiUrl,
-  ).catch((error) => {
-    if (!isInfraError(error, 'not_found')) throw error;
-  });
+  ).catch(ignoreNotFound);
 };
 
 export const scheduleRailwayProjectDelete = async (
@@ -604,7 +698,5 @@ export const scheduleRailwayProjectDelete = async (
     'mutation($id: String!) { projectScheduleDelete(id: $id) }',
     { id: projectId },
     apiUrl,
-  ).catch((error) => {
-    if (!isInfraError(error, 'not_found')) throw error;
-  });
+  ).catch(ignoreNotFound);
 };

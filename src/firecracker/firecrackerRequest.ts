@@ -1,5 +1,5 @@
 import { InfraError } from '../core/infraError.ts';
-import { sendInfraRequest } from '../core/infraFetch.ts';
+import { sendInfraRequest, stripTrailingSlash } from '../core/infraFetch.ts';
 
 export const FIRECRACKER_DEFAULT_BASE_URL = 'http://localhost';
 
@@ -28,7 +28,7 @@ export const sendFirecrackerRequest = async <T>(
     );
   }
 
-  const baseUrl = transport.apiUrl ?? FIRECRACKER_DEFAULT_BASE_URL;
+  const baseUrl = stripTrailingSlash(transport.apiUrl ?? FIRECRACKER_DEFAULT_BASE_URL);
   return sendInfraRequest<T>(`${baseUrl}${path}`, {
     method: init.method ?? 'GET',
     token: transport.token,

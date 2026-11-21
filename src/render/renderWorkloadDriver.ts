@@ -7,8 +7,9 @@ import type {
   WorkloadStatus,
   WorkloadUsage,
 } from '../core/contracts.ts';
-import { InfraError } from '../core/infraError.ts';
+import { assertNoEgressAllowlist, InfraError } from '../core/infraError.ts';
 import { RENDER_REGION } from './renderArchiveDriver.ts';
+import { RENDER_FAILED_DEPLOY_STATUSES, renderPlanForMemoryMb } from './renderPlans.ts';
 import { deleteRenderResource, sendRenderRequest } from './renderRequest.ts';
 
 type RenderWorkloadService = {
@@ -22,13 +23,6 @@ type RenderWorkloadService = {
   };
 };
 
-const FAILED_DEPLOY_STATUSES = new Set([
-  'build_failed',
-  'update_failed',
-  'pre_deploy_failed',
-  'canceled',
-]);
-
 const requireRenderToken = (credentials: WorkloadCredentials): string => {
   if (!credentials.token) {
     throw new InfraError('authentication_failed', 'Render API token is required', {
@@ -38,21 +32,14 @@ const requireRenderToken = (credentials: WorkloadCredentials): string => {
   return credentials.token;
 };
 
-const renderPlanForMemoryMb = (memoryMb: number): string => {
-  if (memoryMb <= 512) return 'starter';
-  if (memoryMb <= 2048) return 'standard';
-  if (memoryMb <= 4096) return 'pro';
-  return 'pro_plus';
-};
-
 const mapRenderRuntimeState = (
   service: RenderWorkloadService,
   latestDeployStatus?: string,
 ): WorkloadRuntimeState => {
   if (service.suspended === 'suspended') return 'suspended';
-  if (!latestDeployStatus) return 'running';
+  if (!latestDeployStatus) return 'provisioning';
   if (latestDeployStatus === 'live') return 'running';
-  if (FAILED_DEPLOY_STATUSES.has(latestDeployStatus)) return 'failed';
+  if (RENDER_FAILED_DEPLOY_STATUSES.has(latestDeployStatus)) return 'failed';
   if (latestDeployStatus === 'deactivated') return 'stopped';
   return 'starting';
 };
@@ -64,6 +51,7 @@ export const renderWorkloadDriver: WorkloadDriver = {
     spec: WorkloadSpec,
   ): Promise<WorkloadHandle> => {
     const token = requireRenderToken(credentials);
+    assertNoEgressAllowlist(spec.egressAllowlist, 'render');
     if (!credentials.workspaceId) {
       throw new InfraError('invalid_request', 'Render workload provisioning requires workspaceId', {
         provider: 'render',
@@ -77,6 +65,7 @@ export const renderWorkloadDriver: WorkloadDriver = {
 
     const serviceType = spec.port?.publicHttps ? 'web_service' : 'background_worker';
     const region = spec.region ?? RENDER_REGION;
+    const plan = renderPlanForMemoryMb(spec.memoryMb).id;
     const created = await sendRenderRequest<{ service: RenderWorkloadService; deployId?: string }>(
       token,
       '/services',
@@ -93,9 +82,11 @@ export const renderWorkloadDriver: WorkloadDriver = {
           envVars,
           serviceDetails: {
             runtime: 'image',
-            plan: renderPlanForMemoryMb(spec.memoryMb),
+            plan,
             region,
-            ...(spec.healthcheckPath ? { healthCheckPath: spec.healthcheckPath } : {}),
+            ...(serviceType === 'web_service' && spec.healthcheckPath
+              ? { healthCheckPath: spec.healthcheckPath }
+              : {}),
             ...(spec.volume
               ? {
                   disk: {
@@ -129,7 +120,7 @@ export const renderWorkloadDriver: WorkloadDriver = {
     const token = requireRenderToken(credentials);
     await sendRenderRequest(
       token,
-      `/services/${handle.workloadId}/suspend`,
+      `/services/${encodeURIComponent(handle.workloadId)}/suspend`,
       { method: 'POST' },
       credentials.apiUrl,
     );
@@ -142,7 +133,7 @@ export const renderWorkloadDriver: WorkloadDriver = {
     const token = requireRenderToken(credentials);
     await sendRenderRequest(
       token,
-      `/services/${handle.workloadId}/resume`,
+      `/services/${encodeURIComponent(handle.workloadId)}/resume`,
       { method: 'POST' },
       credentials.apiUrl,
     );
@@ -153,15 +144,16 @@ export const renderWorkloadDriver: WorkloadDriver = {
     handle: WorkloadHandle,
   ): Promise<WorkloadStatus> => {
     const token = requireRenderToken(credentials);
+    const encodedId = encodeURIComponent(handle.workloadId);
     const service = await sendRenderRequest<RenderWorkloadService>(
       token,
-      `/services/${handle.workloadId}`,
+      `/services/${encodedId}`,
       {},
       credentials.apiUrl,
     );
     const deploys = await sendRenderRequest<{ deploy: { status: string } }[]>(
       token,
-      `/services/${handle.workloadId}/deploys?limit=1`,
+      `/services/${encodedId}/deploys?limit=1`,
       {},
       credentials.apiUrl,
     );
@@ -171,7 +163,7 @@ export const renderWorkloadDriver: WorkloadDriver = {
       workloadId: service.id,
       state: mapRenderRuntimeState(service, latestDeployStatus),
       providerState:
-        service.suspended === 'suspended' ? 'suspended' : (latestDeployStatus ?? 'active'),
+        service.suspended === 'suspended' ? 'suspended' : (latestDeployStatus ?? 'provisioning'),
       region: service.serviceDetails?.region ?? handle.region,
       url: service.serviceDetails?.url ?? handle.url,
       memoryMb: handle.memoryMb,
@@ -183,16 +175,17 @@ export const renderWorkloadDriver: WorkloadDriver = {
     credentials: WorkloadCredentials,
     handle: WorkloadHandle,
   ): Promise<WorkloadUsage> => {
-    const status = await renderWorkloadDriver.fetchWorkloadStatus(credentials, handle);
+    await renderWorkloadDriver.fetchWorkloadStatus(credentials, handle);
     const nowIso = new Date().toISOString();
     return {
       provider: 'render',
       workloadId: handle.workloadId,
       memoryMb: handle.memoryMb ?? 0,
       vcpus: handle.vcpus ?? 0,
-      activeSeconds: status.state === 'running' ? 60 : 0,
-      suspendedSeconds: status.state === 'suspended' ? 60 : 0,
+      activeSeconds: 0,
+      suspendedSeconds: 0,
       rootfsGb: 0,
+      metered: false,
       windowStartIso: nowIso,
       windowEndIso: nowIso,
     };
@@ -202,6 +195,10 @@ export const renderWorkloadDriver: WorkloadDriver = {
     handle: WorkloadHandle,
   ): Promise<void> => {
     const token = requireRenderToken(credentials);
-    await deleteRenderResource(token, `/services/${handle.workloadId}`, credentials.apiUrl);
+    await deleteRenderResource(
+      token,
+      `/services/${encodeURIComponent(handle.workloadId)}`,
+      credentials.apiUrl,
+    );
   },
 };

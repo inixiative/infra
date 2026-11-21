@@ -18,6 +18,7 @@ type MachineRecord = {
     mounts?: { volume: string; path: string }[];
     auto_destroy?: boolean;
     services?: unknown[];
+    checks?: Record<string, unknown>;
     metadata?: Record<string, string>;
   };
   events: { type: string; status: string; timestamp: number }[];
@@ -92,6 +93,7 @@ const server = Bun.serve({
     }
     if (action === 'start' && request.method === 'POST') {
       machine.state = 'started';
+      machine.instance_id = `inst-woken-${++idCounter}`;
       machine.events.push({ type: 'start', status: 'started', timestamp: Date.now() });
       return Response.json({ ok: true });
     }
@@ -110,8 +112,8 @@ const server = Bun.serve({
   },
 });
 
-const apiUrl = `http://127.0.0.1:${server.port}/v1`;
-const credentials = { token: FAKE_TOKEN, appName: 'inixiative-chorus', apiUrl };
+const apiUrl = `http://127.0.0.1:${server.port}/v1/`;
+const credentials = { token: FAKE_TOKEN, appName: 'inixiative-workers', apiUrl };
 
 afterAll(() => server.stop(true));
 
@@ -122,18 +124,19 @@ describe('flyWorkloadDriver', () => {
     state.nextErrorStatus = undefined;
   });
 
-  it('provisions a Firecracker Machine, suspends <= 2048 MB, wakes with wait, tracks event usage, and force-destroys', async () => {
+  it('provisions a Firecracker Machine with checks, suspends+waits, wakes without stale instance_id, reconciles usage, and destroys', async () => {
     const handle = await flyWorkloadDriver.provisionWorkload(credentials, {
-      name: 'chorus-proj-1',
-      image: 'ghcr.io/inixiative/chorus:1.0.0',
+      name: 'worker-proj-1',
+      image: 'ghcr.io/example/worker:1.0.0',
       memoryMb: 2048,
       cpuKind: 'shared',
       vcpus: 2,
       region: 'iad',
-      env: { CHORUS_LAYER: '1' },
-      volume: { name: 'cache', volumeId: 'vol_123', mountPath: '/var/cache/chorus' },
-      labels: { project: 'kingdom' },
+      env: { WORKER_MODE: 'interactive' },
+      volume: { name: 'cache', volumeId: 'vol_123', mountPath: '/var/cache/worker' },
+      labels: { project: 'example' },
       port: { internalPort: 4500, publicHttps: true },
+      healthcheckPath: '/health',
     });
 
     expect(handle).toMatchObject({
@@ -141,7 +144,7 @@ describe('flyWorkloadDriver', () => {
       region: 'iad',
       memoryMb: 2048,
       vcpus: 2,
-      url: 'https://inixiative-chorus.fly.dev',
+      url: 'https://inixiative-workers.fly.dev',
     });
 
     const createdMachine = state.machines.get(handle.workloadId);
@@ -151,48 +154,93 @@ describe('flyWorkloadDriver', () => {
       memory_mb: 2048,
     });
     expect(createdMachine?.config.mounts).toEqual([
-      { volume: 'vol_123', path: '/var/cache/chorus' },
+      { volume: 'vol_123', path: '/var/cache/worker' },
     ]);
+    expect(createdMachine?.config.checks).toMatchObject({
+      httpget: { path: '/health', port: 4500 },
+    });
 
     await flyWorkloadDriver.suspendWorkload(credentials, handle);
-    expect((await flyWorkloadDriver.fetchWorkloadStatus(credentials, handle)).state).toBe(
-      'suspended',
-    );
-
-    await flyWorkloadDriver.wakeWorkload(credentials, handle);
     expect(
       state.requests.some(
         (req) =>
-          req.path === `/apps/inixiative-chorus/machines/${handle.workloadId}/wait` &&
-          req.query.includes('state=started'),
+          req.path === `/apps/inixiative-workers/machines/${handle.workloadId}/wait` &&
+          req.query.includes('state=suspended'),
       ),
     ).toBe(true);
-    expect((await flyWorkloadDriver.fetchWorkloadStatus(credentials, handle)).state).toBe(
-      'running',
+
+    await flyWorkloadDriver.wakeWorkload(credentials, handle);
+    const wakeWait = state.requests.find(
+      (req) =>
+        req.path === `/apps/inixiative-workers/machines/${handle.workloadId}/wait` &&
+        req.query.includes('state=started'),
     );
+    expect(wakeWait).toBeDefined();
+    expect(wakeWait?.query).not.toContain('instance_id');
 
     const machine = state.machines.get(handle.workloadId);
     if (machine) {
       const base = Date.now() - 300_000;
+      machine.state = 'started';
       machine.events = [
         { type: 'start', status: 'started', timestamp: base },
         { type: 'suspend', status: 'suspended', timestamp: base + 100_000 },
         { type: 'start', status: 'started', timestamp: base + 220_000 },
       ];
     }
-    const usage = await flyWorkloadDriver.fetchWorkloadUsage(credentials, handle);
+    const usage = await flyWorkloadDriver.fetchWorkloadUsage(credentials, {
+      ...handle,
+      metadata: { rootfsGb: 'not-a-number' },
+    });
+    expect(usage.metered).toBe(true);
     expect(usage.activeSeconds).toBeGreaterThanOrEqual(170);
     expect(usage.suspendedSeconds).toBe(120);
+    expect(usage.rootfsGb).toBe(0);
+
+    // Reconciles trailing open interval when machine.state disagrees with last event
+    if (machine) {
+      const base = Date.now() - 300_000;
+      machine.state = 'stopped';
+      machine.events = [{ type: 'start', status: 'started', timestamp: base }];
+    }
+    const reconciled = await flyWorkloadDriver.fetchWorkloadUsage(credentials, handle);
+    expect(reconciled.activeSeconds).toBe(0);
+    expect(reconciled.metered).toBe(true);
+
+    // Empty events returns metered=false, 0 seconds
+    if (machine) machine.events = [];
+    const emptyUsage = await flyWorkloadDriver.fetchWorkloadUsage(credentials, handle);
+    expect(emptyUsage).toMatchObject({ activeSeconds: 0, suspendedSeconds: 0, metered: false });
 
     await flyWorkloadDriver.destroyWorkload(credentials, handle);
     expect(state.machines.size).toBe(0);
     await flyWorkloadDriver.destroyWorkload(credentials, handle);
   });
 
-  it('refuses suspendWorkload before calling the API when memoryMb exceeds 2048 MB', async () => {
+  it('rejects missing volumeId, non-empty egressAllowlist, and suspend > 2048 MB', async () => {
+    await expect(
+      flyWorkloadDriver.provisionWorkload(credentials, {
+        name: 'egress-blocked',
+        image: 'ghcr.io/example/worker:1.0.0',
+        memoryMb: 1024,
+        vcpus: 1,
+        egressAllowlist: ['api.example.com'],
+      }),
+    ).rejects.toMatchObject({ code: 'invalid_request', provider: 'fly' });
+
+    await expect(
+      flyWorkloadDriver.provisionWorkload(credentials, {
+        name: 'missing-volume-id',
+        image: 'ghcr.io/example/worker:1.0.0',
+        memoryMb: 1024,
+        vcpus: 1,
+        volume: { name: 'cache', mountPath: '/cache' },
+      }),
+    ).rejects.toMatchObject({ code: 'invalid_request', provider: 'fly' });
+
     const handle = await flyWorkloadDriver.provisionWorkload(credentials, {
       name: 'oversized-machine',
-      image: 'ghcr.io/inixiative/chorus:1.0.0',
+      image: 'ghcr.io/example/worker:1.0.0',
       memoryMb: FLY_SUSPEND_MAX_MEMORY_MB + 512,
       vcpus: 2,
     });
@@ -204,7 +252,6 @@ describe('flyWorkloadDriver', () => {
     });
     expect(state.requests.some((req) => req.path.endsWith('/suspend'))).toBe(false);
 
-    // Also checks machine config from API if handle omitted memoryMb
     const handleWithoutMemory = { ...handle, memoryMb: undefined };
     await expect(
       flyWorkloadDriver.suspendWorkload(credentials, handleWithoutMemory),
@@ -228,11 +275,11 @@ describe('flyWorkloadDriver', () => {
     state.nextErrorStatus = 429;
     await expect(
       flyWorkloadDriver.fetchWorkloadStatus(credentials, { provider: 'fly', workloadId: 'x' }),
-    ).rejects.toMatchObject({ code: 'rate_limited' });
+    ).rejects.toMatchObject({ code: 'rate_limited', retryable: true });
 
     state.nextErrorStatus = 503;
     await expect(
       flyWorkloadDriver.fetchWorkloadStatus(credentials, { provider: 'fly', workloadId: 'x' }),
-    ).rejects.toMatchObject({ code: 'provider_unavailable' });
+    ).rejects.toMatchObject({ code: 'provider_unavailable', retryable: true });
   });
 });

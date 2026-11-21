@@ -7,10 +7,13 @@ import type {
   WorkloadStatus,
   WorkloadUsage,
 } from '../core/contracts.ts';
-import { InfraError, isInfraError } from '../core/infraError.ts';
+import { assertNoEgressAllowlist, InfraError, ignoreNotFound } from '../core/infraError.ts';
 import { sendFlyRequest } from './flyRequest.ts';
 
 export const FLY_SUSPEND_MAX_MEMORY_MB = 2048;
+
+const FLY_WAIT_TIMEOUT_SECONDS = 30;
+const FLY_WAIT_HTTP_TIMEOUT_MS = 40_000;
 
 type FlyMachineEvent = {
   readonly type: string;
@@ -81,6 +84,12 @@ const mapFlyMachineState = (state: string): WorkloadRuntimeState => {
   }
 };
 
+const parseRootfsGb = (raw: string | undefined): number => {
+  if (raw === undefined) return 0;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+};
+
 const accumulateFlyEventDurations = (
   events: readonly FlyMachineEvent[],
   currentState: string,
@@ -88,13 +97,15 @@ const accumulateFlyEventDurations = (
 ): {
   readonly activeSeconds: number;
   readonly suspendedSeconds: number;
+  readonly metered: boolean;
   readonly windowStartMs: number;
   readonly windowEndMs: number;
 } => {
   if (events.length === 0) {
     return {
-      activeSeconds: currentState === 'started' ? 60 : 0,
-      suspendedSeconds: currentState === 'suspended' ? 60 : 0,
+      activeSeconds: 0,
+      suspendedSeconds: 0,
+      metered: false,
       windowStartMs: nowMs,
       windowEndMs: nowMs,
     };
@@ -106,20 +117,32 @@ const accumulateFlyEventDurations = (
 
   for (let index = 0; index < ordered.length; index += 1) {
     const current = ordered[index];
-    const nextTimestamp = ordered[index + 1]?.timestamp ?? nowMs;
-    const durationMs = Math.max(0, nextTimestamp - current.timestamp);
-    if (current.status === 'started') {
-      activeMs += durationMs;
-    } else if (current.status === 'suspended') {
-      suspendedMs += durationMs;
+    const nextEvent = ordered[index + 1];
+    if (nextEvent) {
+      const durationMs = Math.max(0, nextEvent.timestamp - current.timestamp);
+      if (current.status === 'started') {
+        activeMs += durationMs;
+      } else if (current.status === 'suspended') {
+        suspendedMs += durationMs;
+      }
+    } else if (current.status === currentState) {
+      // Only extend the trailing open interval when the last event reconciles with current state.
+      const durationMs = Math.max(0, nowMs - current.timestamp);
+      if (currentState === 'started') {
+        activeMs += durationMs;
+      } else if (currentState === 'suspended') {
+        suspendedMs += durationMs;
+      }
     }
   }
 
+  const lastTimestamp = ordered[ordered.length - 1].timestamp;
   return {
     activeSeconds: Math.round(activeMs / 1000),
     suspendedSeconds: Math.round(suspendedMs / 1000),
+    metered: true,
     windowStartMs: ordered[0].timestamp,
-    windowEndMs: Math.max(nowMs, ordered[ordered.length - 1].timestamp),
+    windowEndMs: Math.max(nowMs, lastTimestamp),
   };
 };
 
@@ -130,6 +153,14 @@ export const flyWorkloadDriver: WorkloadDriver = {
     spec: WorkloadSpec,
   ): Promise<WorkloadHandle> => {
     const { token, appName } = requireFlyAuth(credentials, spec.labels?.['fly.app']);
+    assertNoEgressAllowlist(spec.egressAllowlist, 'fly');
+
+    if (spec.volume && !spec.volume.volumeId) {
+      throw new InfraError('invalid_request', 'Fly.io volume mounts require volume.volumeId', {
+        provider: 'fly',
+      });
+    }
+
     const encodedApp = encodeURIComponent(appName);
 
     const services = spec.port
@@ -148,6 +179,19 @@ export const flyWorkloadDriver: WorkloadDriver = {
         ]
       : undefined;
 
+    const checks = spec.healthcheckPath
+      ? {
+          httpget: {
+            type: 'http',
+            port: spec.port?.internalPort ?? 8080,
+            method: 'GET',
+            path: spec.healthcheckPath,
+            interval: '15s',
+            timeout: '5s',
+          },
+        }
+      : undefined;
+
     const machine = await sendFlyRequest<FlyMachine>(
       token,
       `/apps/${encodedApp}/machines`,
@@ -164,11 +208,11 @@ export const flyWorkloadDriver: WorkloadDriver = {
               cpus: spec.vcpus,
               memory_mb: spec.memoryMb,
             },
-            ...(spec.volume
+            ...(spec.volume?.volumeId
               ? {
                   mounts: [
                     {
-                      volume: spec.volume.volumeId ?? spec.volume.name,
+                      volume: spec.volume.volumeId,
                       path: spec.volume.mountPath,
                     },
                   ],
@@ -176,6 +220,7 @@ export const flyWorkloadDriver: WorkloadDriver = {
               : {}),
             auto_destroy: spec.autoDestroy ?? false,
             ...(services ? { services } : {}),
+            ...(checks ? { checks } : {}),
             ...(spec.labels ? { metadata: spec.labels } : {}),
           },
         },
@@ -232,6 +277,17 @@ export const flyWorkloadDriver: WorkloadDriver = {
       credentials.apiUrl,
     );
 
+    const waitQuery = new URLSearchParams({
+      state: 'suspended',
+      timeout: String(FLY_WAIT_TIMEOUT_SECONDS),
+    });
+    await sendFlyRequest(
+      token,
+      `/apps/${encodedApp}/machines/${encodedId}/wait?${waitQuery}`,
+      { timeoutMs: FLY_WAIT_HTTP_TIMEOUT_MS },
+      credentials.apiUrl,
+    );
+
     return {
       ...handle,
       appName,
@@ -253,14 +309,14 @@ export const flyWorkloadDriver: WorkloadDriver = {
       credentials.apiUrl,
     );
 
-    const waitQuery = new URLSearchParams({ state: 'started', timeout: '30' });
-    if (handle.metadata?.instanceId) {
-      waitQuery.set('instance_id', handle.metadata.instanceId);
-    }
+    const waitQuery = new URLSearchParams({
+      state: 'started',
+      timeout: String(FLY_WAIT_TIMEOUT_SECONDS),
+    });
     await sendFlyRequest(
       token,
       `/apps/${encodedApp}/machines/${encodedId}/wait?${waitQuery}`,
-      {},
+      { timeoutMs: FLY_WAIT_HTTP_TIMEOUT_MS },
       credentials.apiUrl,
     );
 
@@ -317,7 +373,8 @@ export const flyWorkloadDriver: WorkloadDriver = {
       vcpus: machine.config?.guest?.cpus ?? handle.vcpus ?? 0,
       activeSeconds: durations.activeSeconds,
       suspendedSeconds: durations.suspendedSeconds,
-      rootfsGb: Number(handle.metadata?.rootfsGb ?? 2),
+      rootfsGb: parseRootfsGb(handle.metadata?.rootfsGb),
+      metered: durations.metered,
       windowStartIso: new Date(durations.windowStartMs).toISOString(),
       windowEndIso: new Date(durations.windowEndMs).toISOString(),
     };
@@ -335,8 +392,6 @@ export const flyWorkloadDriver: WorkloadDriver = {
       `/apps/${encodedApp}/machines/${encodedId}?force=true`,
       { method: 'DELETE' },
       credentials.apiUrl,
-    ).catch((error) => {
-      if (!isInfraError(error, 'not_found')) throw error;
-    });
+    ).catch(ignoreNotFound);
   },
 };

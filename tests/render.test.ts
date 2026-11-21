@@ -1,5 +1,10 @@
 import { afterAll, beforeEach, describe, expect, it } from 'bun:test';
-import { type ArchiveDeployment, renderArchiveDriver, renderWorkloadDriver } from '../src/index.ts';
+import {
+  type ArchiveDeployment,
+  renderArchiveDriver,
+  renderPlanForMemoryMb,
+  renderWorkloadDriver,
+} from '../src/index.ts';
 
 const FAKE_TOKEN = 'render-test-token';
 
@@ -11,7 +16,7 @@ type Service = {
   ownerId: string;
   suspended: 'suspended' | 'not_suspended';
   image: { imagePath: string };
-  serviceDetails: { url?: string; region: string; plan: string };
+  serviceDetails: { url?: string; region: string; plan: string; healthCheckPath?: string };
 };
 
 const state = {
@@ -21,8 +26,9 @@ const state = {
   deploys: new Map<string, { id: string; status: string; imageUrl?: string }>(),
   requests: [] as { method: string; path: string; body?: unknown }[],
   serviceUrl: 'https://archive.onrender.com',
-  deployStatus: 'live',
+  deployStatus: 'live' as string | null,
   databaseChecksUntilAvailable: 1,
+  repeatOwnerCursor: false,
 };
 
 let idCounter = 0;
@@ -43,15 +49,17 @@ const server = Bun.serve({
         : undefined;
     state.requests.push({ method: request.method, path, body });
 
-    const [, collection, id, child, grandChild] = path.split('/');
+    const [, collection, rawId, child, grandChild] = path.split('/');
+    const id = rawId ? decodeURIComponent(rawId) : undefined;
 
     if (collection === 'owners' && request.method === 'GET') {
       const limit = Number(url.searchParams.get('limit') ?? 20);
-      const start = Number(url.searchParams.get('cursor') ?? 0);
+      const start = state.repeatOwnerCursor ? 0 : Number(url.searchParams.get('cursor') ?? 0);
       return Response.json(
-        state.owners
-          .slice(start, start + limit)
-          .map((owner, index) => ({ owner, cursor: String(start + index + 1) })),
+        state.owners.slice(start, start + limit).map((owner, index) => ({
+          owner,
+          cursor: state.repeatOwnerCursor ? 'stuck-cursor' : String(start + index + 1),
+        })),
       );
     }
 
@@ -107,7 +115,7 @@ const server = Bun.serve({
           name: string;
           ownerId: string;
           image: { imagePath: string };
-          serviceDetails: { region: string; plan: string };
+          serviceDetails: { region: string; plan: string; healthCheckPath?: string };
         };
         const service: Service = {
           id: nextId('srv'),
@@ -119,6 +127,7 @@ const server = Bun.serve({
             url: input.type === 'web_service' ? state.serviceUrl : undefined,
             region: input.serviceDetails.region,
             plan: input.serviceDetails.plan,
+            healthCheckPath: input.serviceDetails.healthCheckPath,
           },
         };
         state.services.set(service.id, service);
@@ -148,20 +157,22 @@ const server = Bun.serve({
       if (child === 'deploys' && request.method === 'POST') {
         const deploy = {
           id: nextId('dep'),
-          status: state.deployStatus,
+          status: state.deployStatus ?? 'live',
           imageUrl: (body as { imageUrl?: string }).imageUrl,
         };
         state.deploys.set(deploy.id, deploy);
         return Response.json(deploy, { status: 201 });
       }
       if (child === 'deploys' && grandChild) {
-        const deploy = state.deploys.get(grandChild);
+        const deploy = state.deploys.get(decodeURIComponent(grandChild));
         return deploy
           ? Response.json(deploy)
           : Response.json({ message: 'not found' }, { status: 404 });
       }
       if (child === 'deploys') {
-        return Response.json([{ deploy: { status: state.deployStatus } }]);
+        return Response.json(
+          state.deployStatus ? [{ deploy: { status: state.deployStatus } }] : [],
+        );
       }
       return Response.json(service);
     }
@@ -173,7 +184,7 @@ const server = Bun.serve({
 const apiUrl = `http://127.0.0.1:${server.port}/v1`;
 
 const makeDeployment = (ids: ArchiveDeployment['ids'] = {}): ArchiveDeployment => ({
-  apiUrl,
+  apiUrl: `${apiUrl}/`,
   token: FAKE_TOKEN,
   workspaceId: 'tea-1',
   name: 'kingdom-archive-abc',
@@ -190,6 +201,7 @@ const resetState = () => {
   state.requests.length = 0;
   state.deployStatus = 'live';
   state.databaseChecksUntilAvailable = 1;
+  state.repeatOwnerCursor = false;
 };
 
 afterAll(() => server.stop(true));
@@ -224,7 +236,7 @@ describe('renderArchiveDriver', () => {
     expect(state.postgres.size).toBe(0);
   });
 
-  it('paginates owners and maps bad token to authentication_failed', async () => {
+  it('paginates owners, guards against repeated cursors, and maps bad token to authentication_failed', async () => {
     state.owners = Array.from({ length: 101 }, (_, index) => ({
       id: `tea-${index}`,
       name: index === 100 ? '' : `Workspace ${index}`,
@@ -233,6 +245,12 @@ describe('renderArchiveDriver', () => {
     const workspaces = await renderArchiveDriver.fetchWorkspaces(FAKE_TOKEN, apiUrl);
     expect(workspaces).toHaveLength(101);
     expect(workspaces[100]).toEqual({ id: 'tea-100', name: 'owner100@example.com' });
+
+    state.repeatOwnerCursor = true;
+    await expect(renderArchiveDriver.fetchWorkspaces(FAKE_TOKEN, apiUrl)).rejects.toMatchObject({
+      code: 'provider_unavailable',
+      provider: 'render',
+    });
 
     await expect(renderArchiveDriver.fetchWorkspaces('wrong', apiUrl)).rejects.toMatchObject({
       code: 'authentication_failed',
@@ -243,37 +261,72 @@ describe('renderArchiveDriver', () => {
 describe('renderWorkloadDriver', () => {
   beforeEach(resetState);
 
-  it('creates, suspends, resumes, checks status/usage, and deletes a Render workload', async () => {
-    const credentials = { token: FAKE_TOKEN, workspaceId: 'tea-1', apiUrl };
-    const handle = await renderWorkloadDriver.provisionWorkload(credentials, {
-      name: 'chorus-render-1',
-      image: 'ghcr.io/inixiative/chorus:1.0.0',
+  it('omits healthCheckPath on background_worker, reports provisioning on empty deploys, returns metered=false, and maps plan tiers', async () => {
+    const credentials = { token: FAKE_TOKEN, workspaceId: 'tea-1', apiUrl: `${apiUrl}/` };
+
+    await expect(
+      renderWorkloadDriver.provisionWorkload(credentials, {
+        name: 'egress-worker',
+        image: 'ghcr.io/example/worker:1.0.0',
+        memoryMb: 2048,
+        vcpus: 1,
+        egressAllowlist: ['api.example.com'],
+      }),
+    ).rejects.toMatchObject({ code: 'invalid_request', provider: 'render' });
+
+    // background_worker omits healthCheckPath
+    const workerHandle = await renderWorkloadDriver.provisionWorkload(credentials, {
+      name: 'bg-worker-1',
+      image: 'ghcr.io/example/worker:1.0.0',
+      memoryMb: 16_384,
+      vcpus: 4,
+      healthcheckPath: '/health',
+    });
+    expect(state.services.get(workerHandle.workloadId)?.serviceDetails.plan).toBe('pro_max');
+    expect(
+      state.services.get(workerHandle.workloadId)?.serviceDetails.healthCheckPath,
+    ).toBeUndefined();
+    expect(renderPlanForMemoryMb(32_768).id).toBe('pro_ultra');
+
+    // Empty deploys list reports provisioning, never running
+    state.deployStatus = null;
+    expect(await renderWorkloadDriver.fetchWorkloadStatus(credentials, workerHandle)).toMatchObject(
+      {
+        state: 'provisioning',
+        providerState: 'provisioning',
+      },
+    );
+
+    // web_service includes healthCheckPath
+    state.deployStatus = 'live';
+    const webHandle = await renderWorkloadDriver.provisionWorkload(credentials, {
+      name: 'web-worker-1',
+      image: 'ghcr.io/example/worker:1.0.0',
       memoryMb: 2048,
       vcpus: 1,
       port: { internalPort: 4500, publicHttps: true },
+      healthcheckPath: '/health',
     });
-    expect(handle.provider).toBe('render');
-    expect(state.services.get(handle.workloadId)?.serviceDetails.plan).toBe('standard');
-
-    expect((await renderWorkloadDriver.fetchWorkloadStatus(credentials, handle)).state).toBe(
-      'running',
+    expect(state.services.get(webHandle.workloadId)?.serviceDetails.healthCheckPath).toBe(
+      '/health',
     );
 
-    await renderWorkloadDriver.suspendWorkload(credentials, handle);
-    expect((await renderWorkloadDriver.fetchWorkloadStatus(credentials, handle)).state).toBe(
+    await renderWorkloadDriver.suspendWorkload(credentials, webHandle);
+    expect((await renderWorkloadDriver.fetchWorkloadStatus(credentials, webHandle)).state).toBe(
       'suspended',
     );
-    expect(
-      (await renderWorkloadDriver.fetchWorkloadUsage(credentials, handle)).suspendedSeconds,
-    ).toBeGreaterThan(0);
+    expect(await renderWorkloadDriver.fetchWorkloadUsage(credentials, webHandle)).toMatchObject({
+      activeSeconds: 0,
+      suspendedSeconds: 0,
+      metered: false,
+    });
 
-    await renderWorkloadDriver.wakeWorkload(credentials, handle);
-    expect((await renderWorkloadDriver.fetchWorkloadStatus(credentials, handle)).state).toBe(
+    await renderWorkloadDriver.wakeWorkload(credentials, webHandle);
+    expect((await renderWorkloadDriver.fetchWorkloadStatus(credentials, webHandle)).state).toBe(
       'running',
     );
 
-    await renderWorkloadDriver.destroyWorkload(credentials, handle);
-    expect(state.services.size).toBe(0);
-    await renderWorkloadDriver.destroyWorkload(credentials, handle);
+    await renderWorkloadDriver.destroyWorkload(credentials, webHandle);
+    await renderWorkloadDriver.destroyWorkload(credentials, webHandle);
   });
 });

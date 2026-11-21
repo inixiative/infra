@@ -1,4 +1,4 @@
-import { sendInfraRequest } from '../core/infraFetch.ts';
+import { sendInfraRequest, stripTrailingSlash } from '../core/infraFetch.ts';
 
 export const FLY_MACHINES_API_URL = 'https://api.machines.dev/v1';
 
@@ -14,7 +14,7 @@ export const sendFlyRequest = async <T>(
   init: FlyRequestInit = {},
   apiUrl = FLY_MACHINES_API_URL,
 ): Promise<T> =>
-  sendInfraRequest<T>(`${apiUrl}${path}`, {
+  sendInfraRequest<T>(`${stripTrailingSlash(apiUrl)}${path}`, {
     method: init.method ?? 'GET',
     token,
     body: init.body,

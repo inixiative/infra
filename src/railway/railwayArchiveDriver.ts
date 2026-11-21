@@ -4,10 +4,10 @@ import {
   ARCHIVE_PORT,
   type ArchiveDeployment,
   type ArchiveHostingDriver,
-  archiveTokenOf,
+  archiveTokenOrThrow,
   type ImageDeployStatus,
 } from '../core/contracts.ts';
-import { InfraError } from '../core/infraError.ts';
+import { InfraError, requireNonEmpty } from '../core/infraError.ts';
 import {
   deployRailwayServiceInstance,
   ensureRailwayProject,
@@ -33,15 +33,6 @@ const DATABASE_MOUNT = '/var/lib/postgresql/data';
 const LIVE_DEPLOYMENTS = new Set(['SUCCESS', 'SLEEPING']);
 const FAILED_DEPLOYMENTS = new Set(['FAILED', 'CRASHED', 'REMOVED', 'SKIPPED']);
 
-const requireDeploymentId = (value: string | undefined, label: string): string => {
-  if (!value) {
-    throw new InfraError('invalid_request', `Archive deployment is missing ${label}`, {
-      provider: 'railway',
-    });
-  }
-  return value;
-};
-
 const generateRandomHexPassword = (): string => {
   const bytes = crypto.getRandomValues(new Uint8Array(32));
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
@@ -59,7 +50,13 @@ const deployOnceIfNeeded = async (
     deployment.apiUrl,
   );
   if (instance.latestDeployment) return instance;
-  await deployRailwayServiceInstance(deployment.token, serviceId, environmentId, deployment.apiUrl);
+  await deployRailwayServiceInstance(
+    deployment.token,
+    serviceId,
+    environmentId,
+    {},
+    deployment.apiUrl,
+  );
   return instance;
 };
 
@@ -127,8 +124,8 @@ export const railwayArchiveDriver: ArchiveHostingDriver = {
   fetchDatabaseReadiness: async (deployment) => {
     const instance = await fetchRailwayServiceInstance(
       deployment.token,
-      requireDeploymentId(deployment.ids.databaseServiceId, 'databaseServiceId'),
-      requireDeploymentId(deployment.ids.environmentId, 'environmentId'),
+      requireNonEmpty(deployment.ids.databaseServiceId, 'archive databaseServiceId', 'railway'),
+      requireNonEmpty(deployment.ids.environmentId, 'archive environmentId', 'railway'),
       deployment.apiUrl,
     );
     const status = instance.latestDeployment?.status;
@@ -140,8 +137,12 @@ export const railwayArchiveDriver: ArchiveHostingDriver = {
     return status === 'SUCCESS';
   },
   provisionService: async (deployment) => {
-    const projectId = requireDeploymentId(deployment.ids.projectId, 'projectId');
-    const environmentId = requireDeploymentId(deployment.ids.environmentId, 'environmentId');
+    const projectId = requireNonEmpty(deployment.ids.projectId, 'archive projectId', 'railway');
+    const environmentId = requireNonEmpty(
+      deployment.ids.environmentId,
+      'archive environmentId',
+      'railway',
+    );
     const serviceId =
       deployment.ids.serviceId ??
       (await ensureRailwayService(
@@ -157,7 +158,7 @@ export const railwayArchiveDriver: ArchiveHostingDriver = {
       environmentId,
       serviceId,
       {
-        ARCHIVE_SERVER_TOKEN: archiveTokenOf(deployment),
+        ARCHIVE_SERVER_TOKEN: archiveTokenOrThrow(deployment),
         PORT: String(ARCHIVE_PORT),
         DATABASE_URL: `postgresql://${ARCHIVE_DATABASE}:\${{${RAILWAY_DATABASE_SERVICE}.POSTGRES_PASSWORD}}@\${{${RAILWAY_DATABASE_SERVICE}.RAILWAY_PRIVATE_DOMAIN}}:5432/${ARCHIVE_DATABASE}`,
       },
@@ -197,8 +198,8 @@ export const railwayArchiveDriver: ArchiveHostingDriver = {
   fetchServiceReadiness: async (deployment) => {
     const instance = await fetchRailwayServiceInstance(
       deployment.token,
-      requireDeploymentId(deployment.ids.serviceId, 'serviceId'),
-      requireDeploymentId(deployment.ids.environmentId, 'environmentId'),
+      requireNonEmpty(deployment.ids.serviceId, 'archive serviceId', 'railway'),
+      requireNonEmpty(deployment.ids.environmentId, 'archive environmentId', 'railway'),
       deployment.apiUrl,
     );
     const status = instance.latestDeployment?.status;
@@ -212,16 +213,20 @@ export const railwayArchiveDriver: ArchiveHostingDriver = {
   fetchServiceFailureStatus: async (deployment) => {
     const instance = await fetchRailwayServiceInstance(
       deployment.token,
-      requireDeploymentId(deployment.ids.serviceId, 'serviceId'),
-      requireDeploymentId(deployment.ids.environmentId, 'environmentId'),
+      requireNonEmpty(deployment.ids.serviceId, 'archive serviceId', 'railway'),
+      requireNonEmpty(deployment.ids.environmentId, 'archive environmentId', 'railway'),
       deployment.apiUrl,
     );
     const status = instance.latestDeployment?.status;
     return status === 'FAILED' || status === 'CRASHED';
   },
   deployImage: async (deployment) => {
-    const environmentId = requireDeploymentId(deployment.ids.environmentId, 'environmentId');
-    const serviceId = requireDeploymentId(deployment.ids.serviceId, 'serviceId');
+    const environmentId = requireNonEmpty(
+      deployment.ids.environmentId,
+      'archive environmentId',
+      'railway',
+    );
+    const serviceId = requireNonEmpty(deployment.ids.serviceId, 'archive serviceId', 'railway');
     await updateRailwayServiceInstance(
       deployment.token,
       serviceId,
@@ -233,6 +238,7 @@ export const railwayArchiveDriver: ArchiveHostingDriver = {
       deployment.token,
       serviceId,
       environmentId,
+      {},
       deployment.apiUrl,
     );
     return { ...deployment.ids, deploymentId };
@@ -240,8 +246,8 @@ export const railwayArchiveDriver: ArchiveHostingDriver = {
   restoreImage: async (deployment) => {
     await updateRailwayServiceInstance(
       deployment.token,
-      requireDeploymentId(deployment.ids.serviceId, 'serviceId'),
-      requireDeploymentId(deployment.ids.environmentId, 'environmentId'),
+      requireNonEmpty(deployment.ids.serviceId, 'archive serviceId', 'railway'),
+      requireNonEmpty(deployment.ids.environmentId, 'archive environmentId', 'railway'),
       { source: { image: `${ARCHIVE_IMAGE}:${deployment.imageVersion}` } },
       deployment.apiUrl,
     );
@@ -249,7 +255,7 @@ export const railwayArchiveDriver: ArchiveHostingDriver = {
   fetchImageDeployStatus: async (deployment): Promise<ImageDeployStatus> => {
     const status = await fetchRailwayDeploymentStatus(
       deployment.token,
-      requireDeploymentId(deployment.ids.deploymentId, 'deploymentId'),
+      requireNonEmpty(deployment.ids.deploymentId, 'archive deploymentId', 'railway'),
       deployment.apiUrl,
     );
     if (LIVE_DEPLOYMENTS.has(status)) return 'live';

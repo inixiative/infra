@@ -17,14 +17,16 @@ export const WORKLOAD_LIFECYCLE_STATES = [
 export type WorkloadLifecycleState = (typeof WORKLOAD_LIFECYCLE_STATES)[number];
 
 export const WORKLOAD_CLASSES = [
-  'chorus-l1',
-  'chorus-l2',
-  'oracle-worker',
-  'adhoc-foundry',
-  'archive',
+  'warm-interactive',
+  'warm-pool',
+  'batch-worker',
+  'ephemeral-session',
+  'always-on',
 ] as const;
 
 export type WorkloadClass = (typeof WORKLOAD_CLASSES)[number];
+
+export type WarmRetentionMode = 'short' | 'extended';
 
 export type WorkingHoursSchedule = {
   readonly timezoneOffsetMinutes: number;
@@ -41,6 +43,7 @@ export type WorkloadLifecyclePolicy = {
   readonly idleSuspendMs: number | null;
   readonly idleStopMs: number | null;
   readonly drainGraceMs: number;
+  readonly pendingApprovalGraceMs: number;
   readonly maxLifetimeMs: number | null;
   readonly maxSuspendedMs: number | null;
   readonly softMemoryRecycleMb: number | null;
@@ -60,10 +63,12 @@ export type WorkloadLifecycleSnapshot = {
   readonly stateEnteredAtMs: number;
   readonly inFlightTurns: number;
   readonly activeBackgroundShells: number;
+  readonly pendingApprovals?: number;
   readonly archiveFlushed: boolean;
-  readonly memoryMb?: number;
+  readonly provisionedMemoryMb?: number;
+  readonly rssMemoryMb?: number;
   readonly pinnedWarm?: boolean;
-  readonly chorusL2Mode?: 'subset' | 'full_warm';
+  readonly warmRetentionMode?: WarmRetentionMode;
 };
 
 export type WorkloadLifecycleAction =

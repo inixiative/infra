@@ -12,6 +12,7 @@ export type WorkloadVolumeSpec = {
   readonly mountPath: string;
   readonly sizeGb?: number;
   readonly volumeId?: string;
+  readonly hostPath?: string;
 };
 
 export type WorkloadPortSpec = {
@@ -54,6 +55,7 @@ export type WorkloadSpec = {
   readonly bootArgs?: string;
   readonly snapshotPath?: string;
   readonly memFilePath?: string;
+  readonly trackDirtyPages?: boolean;
   readonly networkInterface?: WorkloadNetworkInterfaceSpec;
 };
 
@@ -106,6 +108,7 @@ export type WorkloadUsage = {
   readonly activeSeconds: number;
   readonly suspendedSeconds: number;
   readonly rootfsGb: number;
+  readonly metered: boolean;
   readonly windowStartIso: string;
   readonly windowEndIso: string;
 };
@@ -164,7 +167,7 @@ export type HostingWorkspace = {
 
 export type ImageDeployStatus = 'deploying' | 'live' | 'failed';
 
-export const archiveTokenOf = (deployment: ArchiveDeployment): string => {
+export const archiveTokenOrThrow = (deployment: ArchiveDeployment): string => {
   if (!deployment.archiveToken) {
     throw new InfraError('authentication_failed', 'Archive server token is required');
   }

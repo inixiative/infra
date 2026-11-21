@@ -1,5 +1,5 @@
-import { isInfraError } from '../core/infraError.ts';
-import { sendInfraRequest } from '../core/infraFetch.ts';
+import { ignoreNotFound } from '../core/infraError.ts';
+import { sendInfraRequest, stripTrailingSlash } from '../core/infraFetch.ts';
 
 export const RENDER_API_URL = 'https://api.render.com/v1';
 
@@ -14,7 +14,7 @@ export const sendRenderRequest = async <T>(
   init: RenderRequestInit = {},
   apiUrl = RENDER_API_URL,
 ): Promise<T> =>
-  sendInfraRequest<T>(`${apiUrl}${path}`, {
+  sendInfraRequest<T>(`${stripTrailingSlash(apiUrl)}${path}`, {
     method: init.method ?? 'GET',
     token,
     body: init.body,
@@ -26,7 +26,5 @@ export const deleteRenderResource = async (
   path: string,
   apiUrl?: string,
 ): Promise<void> => {
-  await sendRenderRequest(token, path, { method: 'DELETE' }, apiUrl).catch((error) => {
-    if (!isInfraError(error, 'not_found')) throw error;
-  });
+  await sendRenderRequest(token, path, { method: 'DELETE' }, apiUrl).catch(ignoreNotFound);
 };

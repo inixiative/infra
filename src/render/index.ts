@@ -6,6 +6,14 @@ export {
   renderArchiveDriver,
 } from './renderArchiveDriver.ts';
 export {
+  RENDER_ENDED_DEPLOY_STATUSES,
+  RENDER_FAILED_DEPLOY_STATUSES,
+  RENDER_PLAN_TIERS,
+  type RenderPlanId,
+  type RenderPlanTier,
+  renderPlanForMemoryMb,
+} from './renderPlans.ts';
+export {
   deleteRenderResource,
   RENDER_API_URL,
   type RenderRequestInit,

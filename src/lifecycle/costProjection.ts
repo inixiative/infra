@@ -1,6 +1,7 @@
 import type { WorkloadCpuKind } from '../core/contracts.ts';
 import { InfraError } from '../core/infraError.ts';
 import type { InfraProviderId } from '../core/providers.ts';
+import { renderPlanForMemoryMb } from '../render/renderPlans.ts';
 
 const HOURS_PER_MONTH = 730;
 const DEFAULT_RAILWAY_MEMORY_UTILIZATION = 0.65;
@@ -43,10 +44,6 @@ export const HOSTING_PRICING_RATES = {
     suspendedRootfsUsdPerGbMonth: 0.15,
   },
   render: {
-    starterMonthUsd: 7,
-    standardMonthUsd: 25,
-    proMonthUsd: 85,
-    proPlusMonthUsd: 175,
     diskUsdPerGbMonth: 0.25,
   },
   firecracker: {
@@ -79,11 +76,13 @@ const requireNonNegative = (value: number, name: string): void => {
   }
 };
 
-const renderMonthlyTierUsd = (memoryMb: number): number => {
-  if (memoryMb <= 512) return HOSTING_PRICING_RATES.render.starterMonthUsd;
-  if (memoryMb <= 2048) return HOSTING_PRICING_RATES.render.standardMonthUsd;
-  if (memoryMb <= 4096) return HOSTING_PRICING_RATES.render.proMonthUsd;
-  return HOSTING_PRICING_RATES.render.proPlusMonthUsd;
+const requireUnitInterval = (value: number, name: string): void => {
+  if (!Number.isFinite(value) || value < 0 || value > 1) {
+    throw new InfraError(
+      'invalid_request',
+      `${name} must be a finite number in [0, 1] (got ${value})`,
+    );
+  }
 };
 
 export const projectHostingMonthlyCost = (
@@ -95,6 +94,13 @@ export const projectHostingMonthlyCost = (
   requireNonNegative(input.suspendedHoursPerMonth, 'suspendedHoursPerMonth');
   requireNonNegative(input.rootfsGb, 'rootfsGb');
 
+  if (input.activeHoursPerMonth + input.suspendedHoursPerMonth > HOURS_PER_MONTH) {
+    throw new InfraError(
+      'invalid_request',
+      `activeHoursPerMonth + suspendedHoursPerMonth must be <= ${HOURS_PER_MONTH} (got ${input.activeHoursPerMonth + input.suspendedHoursPerMonth})`,
+    );
+  }
+
   const markupMultiplier = input.markupMultiplier ?? 1;
   if (!Number.isFinite(markupMultiplier) || markupMultiplier < 1) {
     throw new InfraError(
@@ -103,13 +109,18 @@ export const projectHostingMonthlyCost = (
     );
   }
 
+  if (input.averageMemoryUtilization !== undefined) {
+    requireUnitInterval(input.averageMemoryUtilization, 'averageMemoryUtilization');
+  }
+  if (input.averageCpuUtilization !== undefined) {
+    requireUnitInterval(input.averageCpuUtilization, 'averageCpuUtilization');
+  }
+
   const memoryGb = input.memoryMb / 1024;
   const activeMonthFraction = input.activeHoursPerMonth / HOURS_PER_MONTH;
-  const totalStoredMonthFraction = Math.min(
-    1,
-    (input.activeHoursPerMonth + input.suspendedHoursPerMonth) / HOURS_PER_MONTH,
-  );
-  const suspendedMonthFraction = Math.min(1, input.suspendedHoursPerMonth / HOURS_PER_MONTH);
+  const totalStoredMonthFraction =
+    (input.activeHoursPerMonth + input.suspendedHoursPerMonth) / HOURS_PER_MONTH;
+  const suspendedMonthFraction = input.suspendedHoursPerMonth / HOURS_PER_MONTH;
 
   let activeComputeUsd = 0;
   let suspendedStorageUsd = 0;
@@ -152,10 +163,11 @@ export const projectHostingMonthlyCost = (
       break;
     }
     case 'render': {
-      activeComputeUsd = renderMonthlyTierUsd(input.memoryMb) * Math.min(1, activeMonthFraction);
+      const plan = renderPlanForMemoryMb(input.memoryMb);
+      activeComputeUsd = plan.monthlyUsd * activeMonthFraction;
       suspendedStorageUsd =
         input.rootfsGb * totalStoredMonthFraction * HOSTING_PRICING_RATES.render.diskUsdPerGbMonth;
-      pricingBasis = 'prorated fixed Render instance tier while unsuspended + persistent disk';
+      pricingBasis = `prorated fixed Render ${plan.id} tier while unsuspended + persistent disk`;
       break;
     }
     case 'firecracker': {
@@ -206,17 +218,20 @@ export const projectHostingMonthlyCost = (
     }
   }
 
-  const rawMonthlyCostUsd = activeComputeUsd + suspendedStorageUsd;
-  const markedUpMonthlyCostUsd = rawMonthlyCostUsd * markupMultiplier;
+  const roundedActive = roundUsd(activeComputeUsd);
+  const roundedStorage = roundUsd(suspendedStorageUsd);
+  const roundedRaw = roundUsd(roundedActive + roundedStorage);
+  const roundedMarkedUp = roundUsd(roundedRaw * markupMultiplier);
+  const roundedMargin = roundUsd(roundedMarkedUp - roundedRaw);
 
   return {
     provider: input.provider,
-    activeComputeUsd: roundUsd(activeComputeUsd),
-    suspendedStorageUsd: roundUsd(suspendedStorageUsd),
-    rawMonthlyCostUsd: roundUsd(rawMonthlyCostUsd),
+    activeComputeUsd: roundedActive,
+    suspendedStorageUsd: roundedStorage,
+    rawMonthlyCostUsd: roundedRaw,
     markupMultiplier,
-    markedUpMonthlyCostUsd: roundUsd(markedUpMonthlyCostUsd),
-    marginUsd: roundUsd(markedUpMonthlyCostUsd - rawMonthlyCostUsd),
+    markedUpMonthlyCostUsd: roundedMarkedUp,
+    marginUsd: roundedMargin,
     pricingBasis,
   };
 };

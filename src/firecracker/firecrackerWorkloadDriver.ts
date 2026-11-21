@@ -7,11 +7,12 @@ import type {
   WorkloadStatus,
   WorkloadUsage,
 } from '../core/contracts.ts';
-import { isInfraError } from '../core/infraError.ts';
+import { assertNoEgressAllowlist, InfraError, ignoreNotFound } from '../core/infraError.ts';
 import { type FirecrackerTransport, sendFirecrackerRequest } from './firecrackerRequest.ts';
 
 const DEFAULT_KERNEL_IMAGE_PATH = '/var/lib/firecracker/vmlinux';
 const DEFAULT_BOOT_ARGS = 'console=ttyS0 reboot=k panic=1 pci=off';
+const SAFE_FIRECRACKER_ID = /^[A-Za-z0-9._-]+$/;
 
 type FirecrackerInstanceInfo = {
   readonly id: string;
@@ -25,6 +26,32 @@ const transportFromCredentials = (credentials: WorkloadCredentials): Firecracker
   unixSocketPath: credentials.unixSocketPath,
   token: credentials.token,
 });
+
+const assertSafeFirecrackerId = (value: string, label: string): string => {
+  if (
+    !value ||
+    value === '.' ||
+    value === '..' ||
+    value.includes('..') ||
+    value.includes('/') ||
+    value.includes('\\') ||
+    value.includes('\0') ||
+    !SAFE_FIRECRACKER_ID.test(value)
+  ) {
+    throw new InfraError(
+      'invalid_request',
+      `Invalid Firecracker ${label}: must match /^[A-Za-z0-9._-]+$/ without path traversal`,
+      { provider: 'firecracker' },
+    );
+  }
+  return value;
+};
+
+const parseRootfsGb = (raw: string | undefined): number => {
+  if (raw === undefined) return 0;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+};
 
 const mapFirecrackerState = (state: string): WorkloadRuntimeState => {
   switch (state) {
@@ -46,6 +73,28 @@ export const firecrackerWorkloadDriver: WorkloadDriver = {
     spec: WorkloadSpec,
   ): Promise<WorkloadHandle> => {
     const transport = transportFromCredentials(credentials);
+    assertNoEgressAllowlist(spec.egressAllowlist, 'firecracker');
+    assertSafeFirecrackerId(spec.name, 'workload name');
+
+    if (spec.volume) {
+      if (spec.volume.name === 'rootfs') {
+        throw new InfraError(
+          'invalid_request',
+          'Firecracker secondary drive name cannot be "rootfs"',
+          { provider: 'firecracker' },
+        );
+      }
+      assertSafeFirecrackerId(spec.volume.name, 'volume name');
+      if (!spec.volume.hostPath) {
+        throw new InfraError(
+          'invalid_request',
+          'Firecracker secondary drives require an explicit volume.hostPath backing file',
+          { provider: 'firecracker' },
+        );
+      }
+    }
+
+    const trackDirtyPages = spec.trackDirtyPages ?? false;
 
     await sendFirecrackerRequest(transport, '/machine-config', {
       method: 'PUT',
@@ -53,6 +102,7 @@ export const firecrackerWorkloadDriver: WorkloadDriver = {
         vcpu_count: spec.vcpus,
         mem_size_mib: spec.memoryMb,
         smt: false,
+        track_dirty_pages: trackDirtyPages,
       },
     });
 
@@ -74,13 +124,13 @@ export const firecrackerWorkloadDriver: WorkloadDriver = {
       },
     });
 
-    if (spec.volume) {
+    if (spec.volume?.hostPath) {
       const encodedDriveId = encodeURIComponent(spec.volume.name);
       await sendFirecrackerRequest(transport, `/drives/${encodedDriveId}`, {
         method: 'PUT',
         body: {
           drive_id: spec.volume.name,
-          path_on_host: spec.volume.volumeId ?? spec.volume.mountPath,
+          path_on_host: spec.volume.hostPath,
           is_root_device: false,
           is_read_only: false,
         },
@@ -88,6 +138,7 @@ export const firecrackerWorkloadDriver: WorkloadDriver = {
     }
 
     if (spec.networkInterface) {
+      assertSafeFirecrackerId(spec.networkInterface.ifaceId, 'network interface id');
       const encodedIfaceId = encodeURIComponent(spec.networkInterface.ifaceId);
       await sendFirecrackerRequest(transport, `/network-interfaces/${encodedIfaceId}`, {
         method: 'PUT',
@@ -105,17 +156,21 @@ export const firecrackerWorkloadDriver: WorkloadDriver = {
     });
 
     const info = await sendFirecrackerRequest<FirecrackerInstanceInfo>(transport, '/');
+    const workloadId = assertSafeFirecrackerId(info.id || spec.name, 'workloadId');
 
     return {
       provider: 'firecracker',
-      workloadId: info.id || spec.name,
+      workloadId,
       name: spec.name,
       region: spec.region,
       memoryMb: spec.memoryMb,
       vcpus: spec.vcpus,
       snapshotPath: spec.snapshotPath,
       memFilePath: spec.memFilePath,
-      metadata: { vmmVersion: info.vmm_version },
+      metadata: {
+        vmmVersion: info.vmm_version,
+        trackDirtyPages: String(trackDirtyPages),
+      },
     };
   },
   suspendWorkload: async (
@@ -123,10 +178,11 @@ export const firecrackerWorkloadDriver: WorkloadDriver = {
     handle: WorkloadHandle,
   ): Promise<WorkloadHandle> => {
     const transport = transportFromCredentials(credentials);
+    const safeWorkloadId = assertSafeFirecrackerId(handle.workloadId, 'workloadId');
     const snapshotPath =
-      handle.snapshotPath ?? `/var/lib/firecracker/snapshots/${handle.workloadId}.snap`;
+      handle.snapshotPath ?? `/var/lib/firecracker/snapshots/${safeWorkloadId}.snap`;
     const memFilePath =
-      handle.memFilePath ?? `/var/lib/firecracker/snapshots/${handle.workloadId}.mem`;
+      handle.memFilePath ?? `/var/lib/firecracker/snapshots/${safeWorkloadId}.mem`;
 
     await sendFirecrackerRequest(transport, '/vm', {
       method: 'PATCH',
@@ -156,6 +212,7 @@ export const firecrackerWorkloadDriver: WorkloadDriver = {
     const info = await sendFirecrackerRequest<FirecrackerInstanceInfo>(transport, '/');
 
     if (info.state === 'Not started' && handle.snapshotPath && handle.memFilePath) {
+      const trackDirtyPages = handle.metadata?.trackDirtyPages === 'true';
       await sendFirecrackerRequest(transport, '/snapshot/load', {
         method: 'PUT',
         body: {
@@ -164,7 +221,7 @@ export const firecrackerWorkloadDriver: WorkloadDriver = {
             backend_path: handle.memFilePath,
             backend_type: 'File',
           },
-          enable_diff_snapshots: true,
+          track_dirty_pages: trackDirtyPages,
           resume_vm: true,
         },
       });
@@ -211,9 +268,10 @@ export const firecrackerWorkloadDriver: WorkloadDriver = {
       workloadId: status.workloadId,
       memoryMb: handle.memoryMb ?? 0,
       vcpus: handle.vcpus ?? 0,
-      activeSeconds: status.state === 'running' ? 60 : 0,
-      suspendedSeconds: status.state === 'suspended' ? 60 : 0,
-      rootfsGb: Number(handle.metadata?.rootfsGb ?? 2),
+      activeSeconds: 0,
+      suspendedSeconds: 0,
+      rootfsGb: parseRootfsGb(handle.metadata?.rootfsGb),
+      metered: false,
       windowStartIso: nowIso,
       windowEndIso: nowIso,
     };
@@ -223,11 +281,17 @@ export const firecrackerWorkloadDriver: WorkloadDriver = {
     _handle: WorkloadHandle,
   ): Promise<void> => {
     const transport = transportFromCredentials(credentials);
+    const info = await sendFirecrackerRequest<FirecrackerInstanceInfo>(transport, '/').catch(
+      (error) => {
+        ignoreNotFound(error);
+        return undefined;
+      },
+    );
+    // Firecracker only accepts SendCtrlAltDel while Running; paused/not-started VMs are reaped by host VMM teardown.
+    if (info?.state !== 'Running') return;
     await sendFirecrackerRequest(transport, '/actions', {
       method: 'PUT',
       body: { action_type: 'SendCtrlAltDel' },
-    }).catch((error) => {
-      if (!isInfraError(error, 'not_found')) throw error;
-    });
+    }).catch(ignoreNotFound);
   },
 };
