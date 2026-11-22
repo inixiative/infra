@@ -15,6 +15,21 @@ export type InfraErrorDetails = {
   readonly retryable?: boolean;
 };
 
+const INFRA_ERROR_BRAND = Symbol.for('@inixiative/infra/InfraError');
+
+const INFRA_ERROR_CODE_MAP: Record<InfraErrorCode, true> = {
+  authentication_failed: true,
+  rate_limited: true,
+  not_found: true,
+  conflict: true,
+  provider_unavailable: true,
+  unreachable: true,
+  invalid_request: true,
+  deploy_failed: true,
+};
+
+const INFRA_ERROR_CODES: ReadonlySet<string> = new Set(Object.keys(INFRA_ERROR_CODE_MAP));
+
 const RETRYABLE_INFRA_ERROR_CODES: ReadonlySet<InfraErrorCode> = new Set([
   'unreachable',
   'rate_limited',
@@ -37,6 +52,13 @@ export class InfraError extends Error {
     this.status = details?.status;
     this.provider = details?.provider;
     this.retryable = details?.retryable ?? RETRYABLE_INFRA_ERROR_CODES.has(code);
+    // Non-enumerable global symbol brand so isInfraError works across subpath bundles and realms.
+    Object.defineProperty(this, INFRA_ERROR_BRAND, {
+      value: true,
+      enumerable: false,
+      writable: false,
+      configurable: false,
+    });
   }
 }
 
@@ -62,8 +84,23 @@ export const infraErrorForStatus = (
   return new InfraError(code, message, { status, provider: details?.provider });
 };
 
-export const isInfraError = (error: unknown, code?: InfraErrorCode): error is InfraError =>
-  error instanceof InfraError && (code === undefined || error.code === code);
+const hasInfraErrorBrand = (error: unknown): error is InfraError => {
+  if (!(error instanceof Error)) return false;
+  const record = error as unknown as Record<PropertyKey, unknown>;
+  return (
+    record[INFRA_ERROR_BRAND] === true &&
+    typeof record.code === 'string' &&
+    INFRA_ERROR_CODES.has(record.code) &&
+    typeof record.retryable === 'boolean' &&
+    (record.status === undefined || typeof record.status === 'number') &&
+    (record.provider === undefined || typeof record.provider === 'string')
+  );
+};
+
+export const isInfraError = (error: unknown, code?: InfraErrorCode): error is InfraError => {
+  if (!(error instanceof InfraError || hasInfraErrorBrand(error))) return false;
+  return code === undefined || error.code === code;
+};
 
 export const requireNonEmpty = (
   value: string | undefined,

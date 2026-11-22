@@ -1,6 +1,6 @@
 {
   "name": "@inixiative/infra",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Stateless infrastructure and hosting drivers (Railway, Render, Fly.io Machines, Firecracker) plus workload lifecycle, wind-down, staggered wake, and hosting cost projection.",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -17,7 +17,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",
     "format": "biome format --write .",
-    "check:all": "bun run typecheck && bun run lint && bun run test",
+    "check:all": "bun run typecheck && bun run lint && bun run build && bun run test",
     "check": "inixiative-config bounded -- bun run check:all",
     "prepublishOnly": "bun run check && bun run build"
   },

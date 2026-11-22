@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import {
   assertNoEgressAllowlist,
   InfraError,
+  ignoreNotFound,
   infraErrorForStatus,
   infraProviderDescriptor,
   isArchiveHostingProvider,
@@ -206,5 +207,113 @@ describe('core primitives', () => {
       isolation: 'microvm',
       supportsSuspend: true,
     });
+  });
+
+  it('brands InfraError with a non-enumerable global symbol and validates branded errors defensively', () => {
+    const brand = Symbol.for('@inixiative/infra/InfraError');
+    const real = new InfraError('not_found', 'Missing resource', {
+      status: 404,
+      provider: 'railway',
+    });
+
+    const descriptor = Object.getOwnPropertyDescriptor(real, brand);
+    expect(descriptor).toEqual({
+      value: true,
+      enumerable: false,
+      writable: false,
+      configurable: false,
+    });
+    expect(Object.keys(real)).not.toContain(String(brand));
+    expect(isInfraError(real)).toBe(true);
+    expect(isInfraError(real, 'not_found')).toBe(true);
+    expect(isInfraError(real, 'conflict')).toBe(false);
+
+    // Simulates an InfraError constructed by another bundle or dual-loaded copy (not instanceof InfraError)
+    const crossBundle = Object.assign(new Error('[render] Missing'), {
+      name: 'InfraError',
+      code: 'not_found',
+      retryable: false,
+      status: 404,
+      provider: 'render',
+      [brand]: true,
+    });
+    expect(crossBundle instanceof InfraError).toBe(false);
+    expect(isInfraError(crossBundle)).toBe(true);
+    expect(isInfraError(crossBundle, 'not_found')).toBe(true);
+    expect(isInfraError(crossBundle, 'rate_limited')).toBe(false);
+    expect(() => ignoreNotFound(crossBundle)).not.toThrow();
+
+    const crossBundleAuth = Object.assign(new Error('[fly] Unauthorized'), {
+      code: 'authentication_failed',
+      retryable: false,
+      [brand]: true,
+    });
+    expect(() => ignoreNotFound(crossBundleAuth)).toThrow(crossBundleAuth);
+
+    // Defensive rejections: non-Error, unbranded, wrong brand value, invalid/missing fields
+    expect(isInfraError(null)).toBe(false);
+    expect(isInfraError(undefined)).toBe(false);
+    expect(isInfraError('not_found')).toBe(false);
+    expect(
+      isInfraError({
+        message: 'plain object',
+        code: 'not_found',
+        retryable: false,
+        [brand]: true,
+      }),
+    ).toBe(false);
+    expect(
+      isInfraError(Object.assign(new Error('unbranded'), { code: 'not_found', retryable: false })),
+    ).toBe(false);
+    expect(
+      isInfraError(
+        Object.assign(new Error('truthy-non-bool-brand'), {
+          code: 'not_found',
+          retryable: false,
+          [brand]: 1,
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      isInfraError(Object.assign(new Error('missing-code'), { retryable: false, [brand]: true })),
+    ).toBe(false);
+    expect(
+      isInfraError(
+        Object.assign(new Error('unknown-code'), {
+          code: 'unknown_code',
+          retryable: false,
+          [brand]: true,
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      isInfraError(
+        Object.assign(new Error('bad-retryable'), {
+          code: 'not_found',
+          retryable: 'false',
+          [brand]: true,
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      isInfraError(
+        Object.assign(new Error('bad-status'), {
+          code: 'not_found',
+          retryable: false,
+          status: '404',
+          [brand]: true,
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      isInfraError(
+        Object.assign(new Error('bad-provider'), {
+          code: 'not_found',
+          retryable: false,
+          provider: 123,
+          [brand]: true,
+        }),
+      ),
+    ).toBe(false);
   });
 });

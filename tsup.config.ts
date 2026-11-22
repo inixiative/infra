@@ -9,6 +9,7 @@ export default node({
     'src/firecracker/index.ts',
     'src/lifecycle/index.ts',
   ],
+  splitting: true,
   minify: true,
   treeshake: true,
   platform: 'node',
