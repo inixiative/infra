@@ -19,7 +19,7 @@
     "format": "biome format --write .",
     "check:all": "bun run typecheck && bun run lint && bun run build && bun run test",
     "check": "inixiative-config bounded -- bun run check:all",
-    "prepublishOnly": "bun run check && bun run build"
+    "prepublishOnly": "bun run check"
   },
   "keywords": [
     "infrastructure",

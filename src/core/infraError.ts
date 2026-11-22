@@ -1,3 +1,5 @@
+import { types } from 'node:util';
+
 export type InfraErrorCode =
   | 'authentication_failed'
   | 'rate_limited'
@@ -85,14 +87,14 @@ export const infraErrorForStatus = (
 };
 
 const hasInfraErrorBrand = (error: unknown): error is InfraError => {
-  if (!(error instanceof Error)) return false;
+  if (!(error instanceof Error || types.isNativeError(error))) return false;
   const record = error as unknown as Record<PropertyKey, unknown>;
   return (
     record[INFRA_ERROR_BRAND] === true &&
     typeof record.code === 'string' &&
     INFRA_ERROR_CODES.has(record.code) &&
     typeof record.retryable === 'boolean' &&
-    (record.status === undefined || typeof record.status === 'number') &&
+    (record.status === undefined || Number.isFinite(record.status)) &&
     (record.provider === undefined || typeof record.provider === 'string')
   );
 };

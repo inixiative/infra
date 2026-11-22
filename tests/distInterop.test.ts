@@ -124,9 +124,25 @@ const collectSubpathErrors = async (
   ];
 };
 
+const REQUIRED_DIST_ENTRIES = [
+  'index.js',
+  'index.cjs',
+  'railway/index.js',
+  'railway/index.cjs',
+  'render/index.js',
+  'render/index.cjs',
+  'fly/index.js',
+  'fly/index.cjs',
+  'firecracker/index.js',
+  'firecracker/index.cjs',
+  'lifecycle/index.js',
+  'lifecycle/index.cjs',
+] as const;
+
 describe('dist cross-subpath isInfraError interop', () => {
   beforeAll(() => {
-    if (!existsSync(join(DIST_DIR, 'index.js')) || !existsSync(join(DIST_DIR, 'index.cjs'))) {
+    const missing = REQUIRED_DIST_ENTRIES.some((entry) => !existsSync(join(DIST_DIR, entry)));
+    if (missing) {
       const result = Bun.spawnSync(['bun', 'run', 'build'], {
         cwd: ROOT,
         stdout: 'pipe',
@@ -138,7 +154,7 @@ describe('dist cross-subpath isInfraError interop', () => {
         );
       }
     }
-  });
+  }, 60_000);
 
   it('recognizes InfraError thrown from every built ESM subpath via dist/index.js', async () => {
     const rootEsm = await importDistEsm<RootModule>('index.js');
