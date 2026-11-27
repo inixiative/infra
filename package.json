@@ -19,7 +19,8 @@
     "format": "biome format --write .",
     "check:all": "bun run typecheck && bun run lint && bun run build && bun run test",
     "check": "inixiative-config bounded -- bun run check:all",
-    "prepublishOnly": "bun run check"
+    "prepublishOnly": "bun run check",
+    "prepare": "if git rev-parse --git-dir >/dev/null 2>&1; then root=\"$(dirname \"$(git rev-parse --path-format=absolute --git-common-dir)\")\"; if [ -x \"$root/node_modules/.bin/lefthook\" ]; then (cd \"$root\" && ./node_modules/.bin/lefthook install); fi; fi"
   },
   "keywords": [
     "infrastructure",
@@ -75,11 +76,12 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.2",
-    "@inixiative/config": "^0.5.237",
+    "@inixiative/config": "^0.5.256",
     "@types/bun": "1.4.4",
     "@types/node": "^25.3.5",
     "tsup": "8.5.1",
-    "typescript": "6.0.3"
+    "typescript": "6.0.3",
+    "lefthook": "2.1.9"
   },
   "packageManager": "bun@1.4.4"
 }
