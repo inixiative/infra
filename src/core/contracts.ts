@@ -91,13 +91,16 @@ export type WorkloadRuntimeState =
 export type WorkloadStatus = {
   readonly provider: ImplementedInfraProvider;
   readonly workloadId: string;
+  readonly name?: string;
   readonly state: WorkloadRuntimeState;
   readonly providerState: string;
   readonly region?: string;
   readonly url?: string;
   readonly memoryMb?: number;
   readonly vcpus?: number;
+  readonly createdAt?: string;
   readonly updatedAt?: string;
+  readonly labels?: Readonly<Record<string, string>>;
 };
 
 export type WorkloadUsage = {
@@ -131,6 +134,7 @@ export type WorkloadDriver = {
     credentials: WorkloadCredentials,
     handle: WorkloadHandle,
   ) => Promise<WorkloadStatus>;
+  readonly fetchWorkloads?: (credentials: WorkloadCredentials) => Promise<WorkloadStatus[]>;
   readonly fetchWorkloadUsage: (
     credentials: WorkloadCredentials,
     handle: WorkloadHandle,
