@@ -76,7 +76,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.2",
-    "@inixiative/config": "^0.5.256",
+    "@inixiative/config": "^0.5.257",
     "@types/bun": "1.4.4",
     "@types/node": "^25.3.5",
     "tsup": "8.5.1",
