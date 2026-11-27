@@ -1,6 +1,6 @@
 {
   "name": "@inixiative/infra",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Stateless infrastructure and hosting drivers (Railway, Render, Fly.io Machines, Firecracker) plus workload lifecycle, wind-down, staggered wake, and hosting cost projection.",
   "type": "module",
   "main": "./dist/index.cjs",
