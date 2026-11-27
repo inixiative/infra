@@ -10,6 +10,7 @@ type MachineRecord = {
   state: string;
   region: string;
   instance_id: string;
+  created_at?: string;
   updated_at: string;
   config: {
     image: string;
@@ -59,6 +60,11 @@ const server = Bun.serve({
       return Response.json({ error: 'not found' }, { status: 404 });
     }
 
+    if (request.method === 'GET' && !machineId) {
+      const machines = [...state.machines.values()].filter((m) => m.appName === appName);
+      return Response.json(machines);
+    }
+
     if (request.method === 'POST' && !machineId) {
       const input = body as {
         name: string;
@@ -73,6 +79,7 @@ const server = Bun.serve({
         state: 'started',
         region: input.region ?? 'iad',
         instance_id: `inst-${idCounter}`,
+        created_at: new Date(now).toISOString(),
         updated_at: new Date(now).toISOString(),
         config: input.config,
         events: [{ type: 'start', status: 'started', timestamp: now - 120_000 }],
@@ -211,6 +218,21 @@ describe('flyWorkloadDriver', () => {
     if (machine) machine.events = [];
     const emptyUsage = await flyWorkloadDriver.fetchWorkloadUsage(credentials, handle);
     expect(emptyUsage).toMatchObject({ activeSeconds: 0, suspendedSeconds: 0, metered: false });
+
+    const listed = await flyWorkloadDriver.fetchWorkloads?.(credentials);
+    expect(listed).toHaveLength(1);
+    expect(listed?.[0]).toMatchObject({
+      provider: 'fly',
+      workloadId: handle.workloadId,
+      name: 'worker-proj-1',
+      state: 'stopped',
+      providerState: 'stopped',
+      region: 'iad',
+      memoryMb: 2048,
+      vcpus: 2,
+      labels: { project: 'example' },
+    });
+    expect(listed?.[0]?.createdAt).toBeDefined();
 
     await flyWorkloadDriver.destroyWorkload(credentials, handle);
     expect(state.machines.size).toBe(0);

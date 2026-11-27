@@ -146,6 +146,24 @@ const accumulateFlyEventDurations = (
   };
 };
 
+const flyMachineToWorkloadStatus = (
+  machine: FlyMachine,
+  handle?: WorkloadHandle,
+): WorkloadStatus => ({
+  provider: 'fly',
+  workloadId: machine.id,
+  name: machine.name,
+  state: mapFlyMachineState(machine.state),
+  providerState: machine.state,
+  region: machine.region,
+  ...(handle?.url !== undefined ? { url: handle.url } : {}),
+  memoryMb: machine.config?.guest?.memory_mb ?? handle?.memoryMb,
+  vcpus: machine.config?.guest?.cpus ?? handle?.vcpus,
+  createdAt: machine.created_at,
+  updatedAt: machine.updated_at,
+  labels: machine.config?.metadata,
+});
+
 export const flyWorkloadDriver: WorkloadDriver = {
   provider: 'fly',
   provisionWorkload: async (
@@ -337,17 +355,20 @@ export const flyWorkloadDriver: WorkloadDriver = {
       credentials.apiUrl,
     );
 
-    return {
-      provider: 'fly',
-      workloadId: machine.id,
-      state: mapFlyMachineState(machine.state),
-      providerState: machine.state,
-      region: machine.region,
-      url: handle.url,
-      memoryMb: machine.config?.guest?.memory_mb ?? handle.memoryMb,
-      vcpus: machine.config?.guest?.cpus ?? handle.vcpus,
-      updatedAt: machine.updated_at,
-    };
+    return flyMachineToWorkloadStatus(machine, handle);
+  },
+  fetchWorkloads: async (credentials: WorkloadCredentials): Promise<WorkloadStatus[]> => {
+    const { token, appName } = requireFlyAuth(credentials);
+    const encodedApp = encodeURIComponent(appName);
+
+    const machines = await sendFlyRequest<FlyMachine[]>(
+      token,
+      `/apps/${encodedApp}/machines`,
+      {},
+      credentials.apiUrl,
+    );
+
+    return machines.map((machine) => flyMachineToWorkloadStatus(machine));
   },
   fetchWorkloadUsage: async (
     credentials: WorkloadCredentials,
